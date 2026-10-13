@@ -1,0 +1,17 @@
+# 凭据与本地运行产物（绝不提交）
+token.txt
+token_*.txt
+*.zip
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# 编辑器
+.idea/
+.vscode/

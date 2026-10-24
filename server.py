@@ -48,6 +48,7 @@ try:
         extract_tool_calls,
         clean_leak_tokens,
         strip_tools_prompt_echo,
+        allowed_tool_names,
     )
 
     TOOL_ENGINE_AVAILABLE = True
@@ -1390,6 +1391,7 @@ def chat_completions():
     if tool_choice == "none":
         tools = []
     protocol_text = ""
+    _allowed_names = allowed_tool_names(tools) if TOOL_ENGINE_AVAILABLE else None
     if tools and TOOL_ENGINE_AVAILABLE:
         # 协议必须位于用户任务之前。Kimi 等模型会拒绝末尾追加的“假装调用工具”指令，
         # 但能可靠地遵循“序列化请求，由外部程序执行”的明确协议。
@@ -1525,6 +1527,7 @@ def chat_completions():
                             or '"tool_calls"' in full_piece
                             or '{"tool_calls' in full_piece
                             or "调用工具" in full_piece
+                            or "DSML" in full_piece
                         ):
                             is_tool_stream = True
                             accumulated_text += full_piece
@@ -1593,7 +1596,8 @@ def chat_completions():
                                 retry_delta = retry_choices[0].get("delta", {}) or {}
                                 accumulated_text += retry_delta.get("content", "") or ""
                     clean_text, tool_calls = extract_tool_calls(
-                        accumulated_text, tools_present=bool(tools)
+                        accumulated_text, tools_present=bool(tools),
+                            allowed_names=_allowed_names
                     )
                     if protocol_text and clean_text:
                         clean_text = strip_tools_prompt_echo(clean_text, protocol_text) or None
@@ -1856,7 +1860,8 @@ def chat_completions():
             if os.environ.get("PROXY_DEBUG_TOOLS") == "1":
                 print(f"[tool-debug] raw={full_content!r}", file=sys.stderr)
             clean_text, tool_calls = extract_tool_calls(
-                full_content, tools_present=bool(tools)
+                full_content, tools_present=bool(tools),
+                allowed_names=_allowed_names
             )
             if tool_calls:
                 full_content = clean_text or None

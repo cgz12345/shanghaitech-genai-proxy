@@ -44,9 +44,9 @@ class ToolCallingTests(unittest.TestCase):
         prompt = build_tools_system_prompt(
             TOOLS, {"type": "function", "function": {"name": "calculator"}}
         )
-        self.assertIn('MUST select the tool named "calculator"', prompt)
+        self.assertIn('MUST call the tool named "calculator"', prompt)
         legacy = build_tools_system_prompt(TOOLS, {"name": "calculator"})
-        self.assertIn('MUST select the tool named "calculator"', legacy)
+        self.assertIn('MUST call the tool named "calculator"', legacy)
 
     def test_kimi_protocol_envelope_is_parsed(self):
         clean, calls = extract_tool_calls(

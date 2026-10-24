@@ -307,10 +307,10 @@ def extract_tool_calls_from_text(text: str) -> Optional[List[Dict[str, Any]]]:
             pass
 
     # 模式 6: 中文口嗨叙述「调用工具: X, 参数: {...}」（DeepSeek 等模型在长工具列表下常见）
-    narration_re = re.compile(r"调用工具[:：]\s*([A-Za-z0-9_\.\-]+)")
+    narration_re = re.compile(r"调用工具[:：]?\s*([A-Za-z0-9_\.\-]+)")
     for nm in narration_re.finditer(text):
-        rest = text[nm.end():]
-        pm = re.search(r"参数[:：]\s*\{", rest)
+        rest = text[nm.end(): nm.end() + 80]
+        pm = re.search(r"参数[:：]?\s*[\(（]?\s*\{", rest)
         if not pm:
             continue
         brace_pos = pm.end() - 1
@@ -339,9 +339,9 @@ def extract_tool_calls_from_text(text: str) -> Optional[List[Dict[str, Any]]]:
 def find_narration_spans(text: str):
     """返回所有「调用工具: X, 参数: {...}」叙述的 (start, end) 精确跨度（任意层级嵌套）。"""
     spans = []
-    for nm in re.finditer(r"调用工具[:：]\s*([A-Za-z0-9_\.\-]+)", text):
-        rest = text[nm.end():]
-        pm = re.search(r"参数[:：]\s*\{", rest)
+    for nm in re.finditer(r"调用工具[:：]?\s*([A-Za-z0-9_\.\-]+)", text):
+        rest = text[nm.end(): nm.end() + 80]
+        pm = re.search(r"参数[:：]?\s*[\(（]?\s*\{", rest)
         if not pm:
             continue
         brace_pos = nm.end() + pm.end() - 1
@@ -405,7 +405,9 @@ def clean_leak_tokens(text: str) -> str:
     return cleaned
 
 
-def extract_tool_calls(text: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+def extract_tool_calls(
+    text: str, tools_present: bool = False
+) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
     """
     server.py 主入口：从模型输出文本中提取工具调用。
     返回 (清理后的正文文本, tool_calls 列表或 None)
@@ -453,4 +455,9 @@ def extract_tool_calls(text: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         clean_text = clean_text.strip()
         return (clean_text if clean_text else None), calls
 
+    if tools_present and text and "调用工具" in text:
+        out = text
+        for s, e in find_narration_spans(out):
+            out = out[:s] + out[e:]
+        return (out if out.strip() else None), None
     return clean_leak_tokens(text), None

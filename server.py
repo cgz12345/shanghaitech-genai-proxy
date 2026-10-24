@@ -1592,7 +1592,9 @@ def chat_completions():
                             if retry_choices:
                                 retry_delta = retry_choices[0].get("delta", {}) or {}
                                 accumulated_text += retry_delta.get("content", "") or ""
-                    clean_text, tool_calls = extract_tool_calls(accumulated_text)
+                    clean_text, tool_calls = extract_tool_calls(
+                        accumulated_text, tools_present=bool(tools)
+                    )
                     if protocol_text and clean_text:
                         clean_text = strip_tools_prompt_echo(clean_text, protocol_text) or None
                     if tool_calls:
@@ -1652,6 +1654,88 @@ def chat_completions():
                             ],
                         }
                         yield f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n"
+
+                # ---- 流式空回复恢复（与非流式对称）：绝不给客户端静默空消息 ----
+                if streamed_chars == 0 and not emitted_tool_calls:
+                    recovered = False
+                    if fallback_reasoning.strip():
+                        rec_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": upstream_model or model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": fallback_reasoning},
+                                "finish_reason": "stop",
+                            }],
+                        }
+                        yield f"data: {json.dumps(rec_chunk, ensure_ascii=False)}\n\n"
+                        recovered = True
+                        _log_ts(f"[stream] 空回复兜底: 交付内置思考 {len(fallback_reasoning)} 字")
+                    elif tools and TOOL_ENGINE_AVAILABLE:
+                        _log_ts("[stream] 空回复恢复: 强制路由重试一次……")
+                        retry_text = ""
+                        for ev in call_upstream_stream(
+                            forced_tool_routing_payload(payload, tools, original_chat_info)
+                        ):
+                            ch_r = (ev.get("choices") or [{}])[0]
+                            retry_text += (ch_r.get("delta", {}) or {}).get("content", "") or ""
+                        clean2, calls2 = extract_tool_calls(retry_text, tools_present=True)
+                        if calls2:
+                            if clean2:
+                                pre2 = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_time,
+                                    "model": upstream_model or model_name,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": clean2},
+                                        "finish_reason": None,
+                                    }],
+                                }
+                                yield f"data: {json.dumps(pre2, ensure_ascii=False)}\n\n"
+                            idx2 = [dict(c, index=i) for i, c in enumerate(calls2)]
+                            tch2 = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": upstream_model or model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "tool_calls": idx2},
+                                    "finish_reason": "tool_calls",
+                                }],
+                            }
+                            yield f"data: {json.dumps(tch2, ensure_ascii=False)}\n\n"
+                            emitted_tool_calls = True
+                            recovered = True
+                            _log_ts("[stream] 空回复恢复: 重试产出 tool_calls ✓")
+                        elif clean2:
+                            rec2 = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": upstream_model or model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": clean2},
+                                    "finish_reason": "stop",
+                                }],
+                            }
+                            yield f"data: {json.dumps(rec2, ensure_ascii=False)}\n\n"
+                            recovered = True
+                            _log_ts(f"[stream] 空回复恢复: 重试产出正文 {len(clean2)} 字 ✓")
+                    if not recovered and streamed_chars == 0 and not emitted_tool_calls:
+                        err_empty = {
+                            "error": {
+                                "message": "Upstream returned an empty response; retried once and still empty. Model may be overloaded — please retry.",
+                                "type": "server_error",
+                            }
+                        }
+                        yield f"data: {json.dumps(err_empty, ensure_ascii=False)}\n\n"
+                        _log_ts("[stream] 空回复: 恢复失败，已发 error 事件")
 
                 yield "data: [DONE]\n\n"
                 _log_ts(
@@ -1771,7 +1855,9 @@ def chat_completions():
         if TOOL_ENGINE_AVAILABLE and tools:
             if os.environ.get("PROXY_DEBUG_TOOLS") == "1":
                 print(f"[tool-debug] raw={full_content!r}", file=sys.stderr)
-            clean_text, tool_calls = extract_tool_calls(full_content)
+            clean_text, tool_calls = extract_tool_calls(
+                full_content, tools_present=bool(tools)
+            )
             if tool_calls:
                 full_content = clean_text or None
                 finish_reason = "tool_calls"
@@ -1799,7 +1885,7 @@ def chat_completions():
                 ):
                     ch = (ev.get("choices") or [{}])[0]
                     retry_text += (ch.get("delta", {}) or {}).get("content", "") or ""
-                clean2, calls2 = extract_tool_calls(retry_text)
+                clean2, calls2 = extract_tool_calls(retry_text, tools_present=True)
                 if calls2:
                     tool_calls = calls2
                     full_content = clean2 or None

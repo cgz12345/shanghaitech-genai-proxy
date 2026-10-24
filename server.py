@@ -74,6 +74,7 @@ PIC_UPLOAD_TOKEN = "2ea38f293adb4abca21132feba61eaa3"
 
 # 可配置自定义访问 API Key（设为空字符串可关闭鉴权）
 LOCAL_API_KEY = os.environ.get("PROXY_API_KEY", "sk-shanghaitech-genai")
+ACTUAL_PORT = int(os.environ.get("PORT", "8000"))
 MAX_REMOTE_IMAGE_BYTES = int(os.environ.get("PROXY_MAX_IMAGE_BYTES", 20 * 1024 * 1024))
 
 
@@ -295,11 +296,18 @@ def find_model_config(model_id: str) -> Dict[str, Any]:
 
 @app.before_request
 def check_auth():
-    if request.path in ["/", "/health"] or request.method == "OPTIONS":
+    if request.path in ["/", "/health", "/healthz"] or request.method == "OPTIONS":
         return None
     if LOCAL_API_KEY:
         auth_header = request.headers.get("Authorization", "")
         supplied = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+        # 兼容多种鉴权头（学习 XV2004/ShTech-Webchat2Api）：x-api-key / api-key
+        if not supplied:
+            supplied = (
+                request.headers.get("x-api-key")
+                or request.headers.get("api-key")
+                or ""
+            )
         valid_keys = [LOCAL_API_KEY]
         upstream_token = get_shanghaitech_token()
         if upstream_token:
@@ -414,6 +422,254 @@ def list_models():
                 }
             )
     return jsonify({"object": "list", "data": openai_models})
+
+# ---------------- Anthropic Messages 适配（学习 jollyxenon / Blue-Flag / XV2004） ----------------
+
+def _anthropic_to_openai(req):
+    """Anthropic Messages 请求 -> 内部 OpenAI Chat 请求。"""
+    out = {
+        "model": req.get("model", "gpt-6-astra"),
+        "max_tokens": req.get("max_tokens", 4096),
+        "stream": bool(req.get("stream")),
+    }
+    msgs = []
+    system = req.get("system")
+    if system:
+        if isinstance(system, list):
+            system = "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
+        msgs.append({"role": "user", "content": "[system instructions]\n" + str(system)})
+        msgs.append({"role": "assistant", "content": "Understood. I will follow these instructions."})
+    for m in req.get("messages", []):
+        role = m.get("role", "user")
+        content = m.get("content")
+        if isinstance(content, str):
+            msgs.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        if role == "assistant":
+            texts, calls = [], []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":
+                    texts.append(b.get("text", ""))
+                elif b.get("type") == "tool_use":
+                    calls.append({
+                        "id": b.get("id", "call_x"), "type": "function",
+                        "function": {"name": b.get("name", ""),
+                                     "arguments": json.dumps(b.get("input", {}), ensure_ascii=False)},
+                    })
+            if calls:
+                msgs.append({"role": "assistant", "content": "\n".join(texts) or None, "tool_calls": calls})
+            elif texts:
+                msgs.append({"role": "assistant", "content": "\n".join(texts)})
+        else:
+            parts, results = [], []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "text":
+                    parts.append({"type": "text", "text": b.get("text", "")})
+                elif t == "image":
+                    s = b.get("source", {}) or {}
+                    if s.get("type") == "base64":
+                        parts.append({"type": "image_url", "image_url": {
+                            "url": "data:%s;base64,%s" % (s.get("media_type", "image/png"), s.get("data", ""))}})
+                elif t == "tool_result":
+                    c = b.get("content")
+                    if isinstance(c, list):
+                        c = "\n".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    results.append({"role": "tool", "tool_call_id": b.get("tool_use_id", "call_x"),
+                                    "content": str(c or "")})
+            if parts:
+                msgs.append({"role": "user", "content": parts})
+            msgs.extend(results)
+    out["messages"] = msgs
+    tools = req.get("tools") or []
+    if tools:
+        out["tools"] = [{
+            "type": "function",
+            "function": {"name": t.get("name"), "description": t.get("description", ""),
+                         "parameters": t.get("input_schema", {})},
+        } for t in tools if isinstance(t, dict)]
+    tc = req.get("tool_choice")
+    if isinstance(tc, dict):
+        t = tc.get("type")
+        if t == "any":
+            out["tool_choice"] = "required"
+        elif t == "tool":
+            out["tool_choice"] = {"type": "function", "function": {"name": tc.get("name")}}
+        elif t == "auto":
+            out["tool_choice"] = "auto"
+    return out
+
+
+def _openai_to_anthropic(body):
+    choice = (body.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) or {}
+    content = []
+    if msg.get("content"):
+        content.append({"type": "text", "text": msg["content"]})
+    for tc in msg.get("tool_calls") or []:
+        try:
+            inp = json.loads(tc["function"].get("arguments") or "{}")
+        except Exception:
+            inp = {}
+        content.append({"type": "tool_use", "id": tc.get("id", ""),
+                        "name": tc["function"].get("name", ""), "input": inp})
+    if not content:
+        content.append({"type": "text", "text": ""})
+    usage = body.get("usage") or {}
+    return {
+        "id": "msg_" + (body.get("id") or uuid.uuid4().hex[:12]),
+        "type": "message", "role": "assistant",
+        "model": body.get("model", ""),
+        "content": content,
+        "stop_reason": "tool_use" if choice.get("finish_reason") == "tool_calls" else "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": usage.get("prompt_tokens", 0) or 0,
+                  "output_tokens": usage.get("completion_tokens", 0) or 0},
+    }
+
+
+def _sse(event, data):
+    return "event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))
+
+
+def _anthropic_stream(internal_url, openai_req):
+    """把内部 OpenAI SSE 翻译为 Anthropic Messages SSE。"""
+    H = {"Authorization": "Bearer " + LOCAL_API_KEY, "Content-Type": "application/json"}
+    msg_id = "msg_" + uuid.uuid4().hex[:12]
+    model = openai_req.get("model", "")
+    started = text_open = False
+    block_index = -1
+    usage_out = 0
+    stop_reason = "end_turn"
+
+    def message_start():
+        return _sse("message_start", {"type": "message_start", "message": {
+            "id": msg_id, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}})
+
+    with httpx.stream("POST", internal_url, headers=H,
+                      json=dict(openai_req, stream=True),
+                      timeout=httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=60.0),
+                      verify=False) as r:
+        if r.status_code != 200:
+            body = r.read().decode("utf-8", errors="ignore")[:200]
+            yield _sse("error", {"type": "error", "error": {"type": "api_error",
+                       "message": "internal error %d: %s" % (r.status_code, body)}})
+            return
+        for line in r.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            d = line[5:].strip()
+            if d == "[DONE]":
+                break
+            try:
+                p = json.loads(d)
+            except Exception:
+                continue
+            ch_list = p.get("choices") or []
+            if not ch_list:
+                continue
+            ch = ch_list[0]
+            delta = ch.get("delta", {}) or {}
+            piece = delta.get("content") or ""
+            tcs = delta.get("tool_calls")
+            if piece:
+                if not started:
+                    started = True
+                    text_open = True
+                    block_index = 0
+                    yield message_start()
+                    yield _sse("content_block_start", {"type": "content_block_start",
+                               "index": 0, "content_block": {"type": "text", "text": ""}})
+                yield _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "text_delta", "text": piece}})
+                usage_out += len(piece) // 4 + 1
+            if tcs:
+                if not started:
+                    started = True
+                    yield message_start()
+                if text_open:
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                    text_open = False
+                for tc in tcs:
+                    block_index += 1
+                    yield _sse("content_block_start", {"type": "content_block_start", "index": block_index,
+                               "content_block": {"type": "tool_use", "id": tc.get("id", ""),
+                                                 "name": tc.get("function", {}).get("name", ""), "input": {}}})
+                    yield _sse("content_block_delta", {"type": "content_block_delta", "index": block_index,
+                               "delta": {"type": "input_json_delta",
+                                         "partial_json": tc.get("function", {}).get("arguments", "{}")}})
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                stop_reason = "tool_use"
+            if ch.get("finish_reason") == "tool_calls":
+                stop_reason = "tool_use"
+    if not started:
+        yield message_start()
+        yield _sse("content_block_start", {"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}})
+        text_open = True
+        block_index = 0
+    if text_open:
+        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+    yield _sse("message_delta", {"type": "message_delta",
+               "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+               "usage": {"output_tokens": usage_out}})
+    yield _sse("message_stop", {"type": "message_stop"})
+
+
+@app.route("/v1/messages", methods=["POST"])
+def anthropic_messages():
+    """Anthropic Messages 端点：内部转换为 OpenAI 流程，复用全部能力（工具/多模态/空回复恢复）。"""
+    req = request.get_json(force=True, silent=True) or {}
+    openai_req = _anthropic_to_openai(req)
+    internal = "http://127.0.0.1:%d/v1/chat/completions" % ACTUAL_PORT
+    if req.get("stream"):
+        def gen():
+            for chunk in _anthropic_stream(internal, openai_req):
+                yield chunk
+        resp = Response(gen(), mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+    H = {"Authorization": "Bearer " + LOCAL_API_KEY, "Content-Type": "application/json"}
+    try:
+        r = httpx.post(internal, headers=H, json=openai_req, timeout=600.0, verify=False)
+    except httpx.HTTPError as exc:
+        return jsonify({"type": "error", "error": {"type": "api_error",
+                        "message": "internal call failed: %s" % exc}}), 502
+    if r.status_code != 200:
+        try:
+            detail = (r.json().get("error") or {}).get("message")
+        except Exception:
+            detail = r.text[:150]
+        return jsonify({"type": "error", "error": {"type": "api_error",
+                        "message": detail or ("internal %d" % r.status_code)}}), r.status_code
+    return jsonify(_openai_to_anthropic(r.json()))
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    """代理存活检查（不代表上游可用；上游状态看 /health）。"""
+    return jsonify({"status": "ok"})
+
+
+@app.route("/v1/models/<path:model_id>", methods=["GET"])
+def get_model(model_id):
+    """单模型查询。"""
+    for m in list_models().get_json()["data"]:
+        if str(m.get("id", "")).lower() == model_id.strip().lower():
+            return jsonify(m)
+    return jsonify(
+        {"error": {"message": "The model '%s' does not exist" % model_id,
+                   "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}
+    ), 404
+
 
 
 # ---------------- 多模态支持 ----------------
@@ -1587,6 +1843,7 @@ if __name__ == "__main__":
         print("=" * 64)
         sys.exit(0)
     actual_port = resolve_actual_port(requested_port)
+    ACTUAL_PORT = actual_port
 
     # 2. 只有真实端口完全确定后，才打印 Banner，保证界面显示的地址与实际运行绝对一致！
     print_banner(actual_port=actual_port)

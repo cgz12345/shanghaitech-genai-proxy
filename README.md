@@ -9,7 +9,7 @@
 - **完整 OpenAI Chat Completions**：流式（SSE）与非流式，`/v1/models` 动态枚举。
 - **Agent 工具调用（Function Calling）**：支持 `tools` / `tool_choice` 与旧版 `functions` / `function_call`，包括流式 `delta.tool_calls` 与工具结果回传；可把网页模型生成的各种工具调用格式（含 Qwen 私有标记）统一转换为标准结构。
 - **多模态**：图片理解（`image_url`，支持 Base64 与远程 URL）、PDF 文档问答（`type: file`）。
-- **额外入口**：文生图 `/v1/images/generations`、文字转语音 `/v1/audio/speech`、语音转文字 `/v1/audio/transcriptions`。
+- **额外入口**：文生图 `/v1/images/generations`、文字转语音 `/v1/audio/speech`、语音转文字 `/v1/audio/transcriptions`、**Anthropic Messages `/v1/messages`**（Claude Code / Claude 系客户端原生可用，含流式与 tool_use）、单模型查询 `/v1/models/{id}`、存活检查 `/healthz`。
 - **零配置刷新凭据**：`get_token.bat` 自动打开独立浏览器窗口，登录后自动提取并验证凭据，无需 F12。
 - **凭据自动续期**：服务内置后台守护，Token 过期前 2 小时自动通过专用浏览器静默续期（SSO 会话存活时全程零交互）。若 SSO 会话也失效，可创建 `credentials.txt`（格式见 `credentials.txt.example`）实现全自动登录；未配置时保持浏览器窗口打开并弹窗提醒手动登录。
 - **生产级服务**：Waitress WSGI + 智能端口检测（占用时自动避让并在启动窗口如实显示）。
@@ -99,6 +99,8 @@ client.chat.completions.create(
 | `token.txt` | **你的**登录凭据（首次获取时生成；已在 `.gitignore` 中，绝不会提交） |
 | `token_auto_refresh.py` | 凭据自动续期后台服务 |
 | `SECURITY.md` | 部署、凭据与网络安全说明 |
+
+鉴权支持 `Authorization: Bearer`、`x-api-key`、`api-key` 三种请求头。
 | `test_tool_calling.py` | 离线回归测试 |
 
 ## 安全与隐私

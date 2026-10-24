@@ -75,6 +75,38 @@ PIC_UPLOAD_TOKEN = "2ea38f293adb4abca21132feba61eaa3"
 # 可配置自定义访问 API Key（设为空字符串可关闭鉴权）
 LOCAL_API_KEY = os.environ.get("PROXY_API_KEY", "sk-shanghaitech-genai")
 ACTUAL_PORT = int(os.environ.get("PORT", "8000"))
+
+# 并发限制（学习 XV2004/ShTech-Webchat2Api）：同时进行的上游对话数上限，超出排队等待；
+# 排队超时返回 429。设为 0 关闭限制。内部自调用（/v1/messages 适配层）豁免以免自锁。
+import threading as _threading
+
+MAX_CONCURRENT_CHATS = int(os.environ.get("PROXY_MAX_CONCURRENCY", "4"))
+QUEUE_TIMEOUT_SECONDS = float(os.environ.get("PROXY_QUEUE_TIMEOUT", "300"))
+_chat_semaphore = (
+    _threading.BoundedSemaphore(MAX_CONCURRENT_CHATS)
+    if MAX_CONCURRENT_CHATS > 0
+    else None
+)
+
+
+class _QueueFullError(Exception):
+    pass
+
+
+def _acquire_chat_slot(internal: bool) -> bool:
+    if internal or _chat_semaphore is None:
+        return False  # 无需持有
+    if not _chat_semaphore.acquire(timeout=QUEUE_TIMEOUT_SECONDS):
+        raise _QueueFullError()
+    return True
+
+
+def _release_chat_slot(held: bool) -> None:
+    if held and _chat_semaphore is not None:
+        try:
+            _chat_semaphore.release()
+        except ValueError:
+            pass
 MAX_REMOTE_IMAGE_BYTES = int(os.environ.get("PROXY_MAX_IMAGE_BYTES", 20 * 1024 * 1024))
 
 
@@ -540,7 +572,7 @@ def _sse(event, data):
 
 def _anthropic_stream(internal_url, openai_req):
     """把内部 OpenAI SSE 翻译为 Anthropic Messages SSE。"""
-    H = {"Authorization": "Bearer " + LOCAL_API_KEY, "Content-Type": "application/json"}
+    H = {"Authorization": "Bearer " + LOCAL_API_KEY, "Content-Type": "application/json", "X-Proxy-Internal": "1"}
     msg_id = "msg_" + uuid.uuid4().hex[:12]
     model = openai_req.get("model", "")
     started = text_open = False
@@ -637,7 +669,7 @@ def anthropic_messages():
         resp = Response(gen(), mimetype="text/event-stream")
         resp.headers["Cache-Control"] = "no-cache"
         return resp
-    H = {"Authorization": "Bearer " + LOCAL_API_KEY, "Content-Type": "application/json"}
+    H = {"Authorization": "Bearer " + LOCAL_API_KEY, "Content-Type": "application/json", "X-Proxy-Internal": "1"}
     try:
         r = httpx.post(internal, headers=H, json=openai_req, timeout=600.0, verify=False)
     except httpx.HTTPError as exc:
@@ -1233,6 +1265,7 @@ def audio_transcriptions():
 def chat_completions():
     """标准 OpenAI Chat Completions 接口（支持多模态）"""
     req_data = request.get_json(force=True, silent=True) or {}
+    internal_call = request.headers.get("X-Proxy-Internal") == "1"
 
     messages = req_data.get("messages", [])
     model_name = req_data.get("model", "gpt-6-astra")
@@ -1418,6 +1451,18 @@ def chat_completions():
             _log_ts(f"[stream] 开始: model={model_name} stream=True tools={len(tools or [])}")
             if TOKEN_AUTO_REFRESH_AVAILABLE:
                 token_auto_refresh.stream_started()
+            slot_held = False
+            try:
+                slot_held = _acquire_chat_slot(internal_call)
+            except _QueueFullError:
+                if TOKEN_AUTO_REFRESH_AVAILABLE:
+                    token_auto_refresh.stream_ended()
+                _log_ts(f"[stream] 429: 并发已达 {MAX_CONCURRENT_CHATS}，排队 {QUEUE_TIMEOUT_SECONDS}s 超时")
+                busy = {"error": {"message": f"Proxy busy: {MAX_CONCURRENT_CHATS} concurrent chats limit reached, queue timeout.",
+                                  "type": "rate_limit_error", "param": None, "code": "proxy_busy"}}
+                yield f"data: {json.dumps(busy, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
             try:
                 # Kimi 的工具响应先缓冲完整输出，以拦截上游的“内置工具禁用”拒绝语。
                 pending_tail = ""  # 尾部保留区：防止探针词被 chunk 边界拆开漏检
@@ -1610,6 +1655,7 @@ def chat_completions():
                 )
                 if TOKEN_AUTO_REFRESH_AVAILABLE:
                     token_auto_refresh.stream_ended()
+                _release_chat_slot(slot_held)
             except GeneratorExit:
                 _log_ts(
                     f"[stream] 客户端中断: model={model_name} 用时 {time.time() - t0:.1f}s"
@@ -1617,6 +1663,7 @@ def chat_completions():
                 )
                 if TOKEN_AUTO_REFRESH_AVAILABLE:
                     token_auto_refresh.stream_ended()
+                _release_chat_slot(slot_held)
                 raise
             except Exception as ex:
                 _log_ts(
@@ -1625,6 +1672,7 @@ def chat_completions():
                 )
                 if TOKEN_AUTO_REFRESH_AVAILABLE:
                     token_auto_refresh.stream_ended()
+                _release_chat_slot(slot_held)
                 err_chunk = {
                     "error": {
                         "message": f"Proxy upstream error: {str(ex)}",
@@ -1642,6 +1690,14 @@ def chat_completions():
         finish_reason = "stop"
         usage_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
+        slot_held = False
+        try:
+            slot_held = _acquire_chat_slot(internal_call)
+        except _QueueFullError:
+            return jsonify(
+                {"error": {"message": f"Proxy busy: {MAX_CONCURRENT_CHATS} concurrent chats limit reached, queue timeout.",
+                           "type": "rate_limit_error", "param": None, "code": "proxy_busy"}}
+            ), 429
         try:
             for parsed in call_upstream_stream(payload):
                 if tools and os.environ.get("PROXY_DEBUG_TOOLS") == "1":
@@ -1662,6 +1718,8 @@ def chat_completions():
                 if parsed.get("usage"):
                     usage_info = parsed.get("usage")
         except Exception as ex:
+            _release_chat_slot(slot_held)
+            slot_held = False
             return jsonify(
                 {
                     "error": {
@@ -1670,6 +1728,8 @@ def chat_completions():
                     }
                 }
             ), 502
+        _release_chat_slot(slot_held)
+        slot_held = False
 
         if tools and "kimi" in model_name.lower() and is_tool_refusal(full_content):
             full_content = ""

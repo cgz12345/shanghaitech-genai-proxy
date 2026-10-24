@@ -1,0 +1,24 @@
+services:
+  genai-proxy:
+    build: .
+    container_name: genai-proxy
+    # 仅绑定本机；局域网使用改成 "8000:8000"
+    ports:
+      - "127.0.0.1:8000:8000"
+    # 凭据从宿主机挂载（只读），不在镜像内
+    volumes:
+      - ./token.txt:/app/token.txt:ro
+    environment:
+      PROXY_API_KEY: "sk-shanghaitech-genai"
+      # 并发限制（学习 XV2004），按需调整；0 = 不限
+      PROXY_MAX_CONCURRENCY: "4"
+      PROXY_QUEUE_TIMEOUT: "300"
+    restart: unless-stopped
+    # 加固（学习 Blue-Flag-666/ShTech-Webchat2Api）
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

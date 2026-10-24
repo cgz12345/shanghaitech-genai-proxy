@@ -13,6 +13,10 @@
 - **零配置刷新凭据**：`get_token.bat` 自动打开独立浏览器窗口，登录后自动提取并验证凭据，无需 F12。
 - **凭据自动续期**：服务内置后台守护，Token 过期前 2 小时自动通过专用浏览器静默续期（SSO 会话存活时全程零交互）。若 SSO 会话也失效，可创建 `credentials.txt`（格式见 `credentials.txt.example`）实现全自动登录；未配置时保持浏览器窗口打开并弹窗提醒手动登录。
 - **生产级服务**：Waitress WSGI + 智能端口检测（占用时自动避让并在启动窗口如实显示）。
+- **并发限制队列**（学习 XV2004）：`PROXY_MAX_CONCURRENCY`（默认 4）限制同时进行的上游对话，超出排队；排队超 `PROXY_QUEUE_TIMEOUT`（默认 300s）返回 429。
+- **诊断与基准工具**（学习 jollyxenon）：`python bench.py --doctor` 一键体检；`python bench.py` 测各模型 TTFT 与解码速度。
+- **Docker 加固部署**（学习 Blue-Flag-666）：只读根文件系统、`cap-drop ALL`、`no-new-privileges`、非 root 用户、healthcheck，见 `compose.yaml`。
+- **CI**（学习 Blue-Flag-666）：GitHub Actions 离线测试矩阵（Ubuntu/Windows × Python 3.10/3.12），不触网。
 - **安全默认值**：远程图片默认禁止访问本机/内网地址；请求体与图片大小有上限；上游认证失效时返回明确的 HTTP 503 而不是空回复。
 
 ## 快速开始
@@ -82,7 +86,8 @@ client.chat.completions.create(
 
 ## 运维
 
-- **查看状态**：`GET /health`，其中 `upstream_auth` 应为 `valid`；若为 `expired` / `missing`，后台会自动触发续期（需浏览器窗口登录一次），或手动运行 `get_token.bat`。
+- **查看状态**：`python bench.py --doctor` 一键体检；`GET /health`，其中 `upstream_auth` 应为 `valid`；
+- **Docker 部署**：`docker compose up -d`（凭据经 `./token.txt` 只读挂载进容器；容器内浏览器续期不可用，凭据过期请在宿主机刷新）。若为 `expired` / `missing`，后台会自动触发续期（需浏览器窗口登录一次），或手动运行 `get_token.bat`。
 - **模型列表**：`GET /v1/models`。
 - **指定端口**：`start.bat 8080` 或环境变量 `PORT`。
 - **可调环境变量**：`PROXY_API_KEY`（访问密钥）、`PROXY_MAX_REQUEST_BYTES`（请求体上限，默认 32 MiB）、`PROXY_MAX_IMAGE_BYTES`（远程图片上限，默认 20 MiB）、`ALLOW_PRIVATE_IMAGE_URLS=1`（允许远程图片访问内网，默认禁止）。

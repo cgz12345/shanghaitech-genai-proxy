@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+token*.txt
+credentials.txt
+*.zip
+*.log
+.git/
+.ruff_cache/

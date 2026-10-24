@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Offline protocol/auth/security tests
+        # 模拟上游、不触网（学习 Blue-Flag-666 的 CI 思路）
+        env:
+          SHANGHAITECH_TOKEN: x.eyJleHAiOjIwMDAwMDAwMDB9.x
+        run: python test_tool_calling.py -v
+      - name: Syntax check
+        run: python -m py_compile server.py tool_calling_engine.py token_auto_refresh.py get_token.py bench.py

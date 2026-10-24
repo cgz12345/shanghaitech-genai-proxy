@@ -53,6 +53,13 @@ try:
 except ImportError:
     TOOL_ENGINE_AVAILABLE = False
 
+try:
+    import token_auto_refresh
+
+    TOKEN_AUTO_REFRESH_AVAILABLE = True
+except ImportError:
+    TOKEN_AUTO_REFRESH_AVAILABLE = False
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(
     os.environ.get("PROXY_MAX_REQUEST_BYTES", 32 * 1024 * 1024)
@@ -258,6 +265,11 @@ def fetch_shanghaitech_models() -> list:
     return _models_cache["data"]
 
 
+def _log_ts(msg: str) -> None:
+    """带时间戳的控制台日志（断流/续期等关键事件必须可追溯）。"""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def find_model_config(model_id: str) -> Dict[str, Any]:
     """按模型配置匹配：同时接受学校内部 ID（aiType）与网页显示名（aiName），大小写不敏感。"""
     models = fetch_shanghaitech_models()
@@ -305,6 +317,9 @@ def check_auth():
                 }
             ), 401
     if request.path.startswith("/v1/") and upstream_auth_status() != "valid":
+        # 触发后台自动续期（若自动刷新模块可用），并向前端返回明确错误
+        if TOKEN_AUTO_REFRESH_AVAILABLE:
+            token_auto_refresh.kick()
         return jsonify(
             {
                 "error": {
@@ -606,60 +621,99 @@ def upload_document_to_genai(
 
 
 def call_upstream_stream(payload: Dict[str, Any]) -> Generator[dict, None, None]:
-    """请求上科大 SSE 并产出解析后的 JSON 事件"""
+    """请求上科大 SSE 并产出解析后的 JSON 事件。
+
+    超时策略: 分段超时——连接 15s，读 600s（大 prompt + 本地 GPU 慢首字可长达数分钟），
+    写/池 60s。首字到达前的瞬时网络错误（读超时/连接错误）自动重试最多 2 次；
+    一旦开始产出内容则不再重试（无法续传，避免内容重复）。
+    """
     headers = get_headers()
-    with httpx.Client(verify=False, timeout=180.0) as client:
-        with client.stream(
-            "POST",
-            f"{SHANGHAITECH_BASE_URL}/chat/start/chat",
-            json=payload,
-            headers=headers,
-        ) as resp:
-            ctype = (resp.headers.get("content-type") or "").lower()
-            if "text/event-stream" not in ctype:
-                snippet = resp.read().decode("utf-8", errors="ignore")[:150].strip()
-                raise RuntimeError(
-                    f"上游返回非流式响应，登录凭据可能已失效，请重新登录并更新 token.txt。上游内容: {snippet}"
-                )
-            saw_choices = False
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                if line.startswith("data:"):
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        if not saw_choices:
-                            raise RuntimeError(
-                                "upstream returned no chat choices; refresh token or check model availability"
-                            )
-                        return
-                    try:
-                        parsed = json.loads(data_str)
-                    except Exception:
-                        continue
-                    if parsed.get("error"):
-                        error = parsed["error"]
-                        message = (
-                            error.get("message")
-                            if isinstance(error, dict)
-                            else str(error)
-                        )
-                        raise RuntimeError(message or "upstream returned an error")
-                    if isinstance(parsed.get("code"), int) and parsed["code"] >= 400:
+    stream_timeout = httpx.Timeout(
+        connect=15.0, read=600.0, write=60.0, pool=60.0
+    )
+    max_ttft_retries = 2
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1 + max_ttft_retries):
+        got_any = False
+        try:
+            with httpx.Client(verify=False, timeout=stream_timeout) as client:
+                with client.stream(
+                    "POST",
+                    f"{SHANGHAITECH_BASE_URL}/chat/start/chat",
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    if "text/event-stream" not in ctype:
+                        snippet = resp.read().decode(
+                            "utf-8", errors="ignore"
+                        )[:150].strip()
                         raise RuntimeError(
-                            parsed.get("errMsg")
-                            or parsed.get("message")
-                            or f"upstream error {parsed['code']}"
+                            f"上游返回非流式响应，登录凭据可能已失效，请重新登录并更新 token.txt。上游内容: {snippet}"
                         )
-                    if "other" in parsed and "choices" not in parsed:
-                        continue
-                    if parsed.get("choices"):
-                        saw_choices = True
-                    yield parsed
-            if not saw_choices:
-                raise RuntimeError(
-                    "upstream returned no chat choices; refresh token or check model availability"
+                    saw_choices = False
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                if not saw_choices:
+                                    raise RuntimeError(
+                                        "upstream returned no chat choices; refresh token or check model availability"
+                                    )
+                                return
+                            try:
+                                parsed = json.loads(data_str)
+                            except Exception:
+                                continue
+                            if parsed.get("error"):
+                                error = parsed["error"]
+                                message = (
+                                    error.get("message")
+                                    if isinstance(error, dict)
+                                    else str(error)
+                                )
+                                raise RuntimeError(message or "upstream returned an error")
+                            if isinstance(parsed.get("code"), int) and parsed["code"] >= 400:
+                                raise RuntimeError(
+                                    parsed.get("errMsg")
+                                    or parsed.get("message")
+                                    or f"upstream error {parsed['code']}"
+                                )
+                            if "other" in parsed and "choices" not in parsed:
+                                continue
+                            if parsed.get("choices"):
+                                saw_choices = True
+                                got_any = True
+                            yield parsed
+                    if not saw_choices:
+                        raise RuntimeError(
+                            "upstream returned no chat choices; refresh token or check model availability"
+                        )
+                    return
+        except (
+            httpx.ReadTimeout,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+        ) as exc:
+            last_error = exc
+            if got_any or attempt >= max_ttft_retries:
+                _log_ts(
+                    f"[stream] 上游流{'中断(已产出内容,无法续传)' if got_any else '首字前失败'}: "
+                    f"{type(exc).__name__}: {str(exc)[:120]}"
+                    + (f"（第 {attempt + 1} 次尝试）" if got_any is False else "")
                 )
+                raise
+            _log_ts(
+                f"[stream] 首字前网络错误（{type(exc).__name__}），自动重试 "
+                f"{attempt + 1}/{max_ttft_retries}…"
+            )
+            time.sleep(1.5)
+    if last_error:
+        raise last_error
 
 
 def call_upstream_json(
@@ -980,7 +1034,7 @@ def chat_completions():
     # 请求摘要日志：用于诊断客户端是否传入了工具定义
     n_tools = len(req_data.get("tools") or req_data.get("functions") or [])
     print(
-        f"[req] model={model_name} stream={stream} msgs={len(messages)} tools={n_tools}",
+        f"[req] {time.strftime('%H:%M:%S')} model={model_name} stream={stream} msgs={len(messages)} tools={n_tools}",
         file=sys.stderr,
     )
 
@@ -1096,10 +1150,15 @@ def chat_completions():
     if stream:
 
         def generate() -> Generator[str, None, None]:
+            t0 = time.time()
+            accumulated_text = ""
+            streamed_chars = 0
+            is_tool_stream = bool(tools and "kimi" in model_name.lower())
+            _log_ts(f"[stream] 开始: model={model_name} stream=True tools={len(tools or [])}")
+            if TOKEN_AUTO_REFRESH_AVAILABLE:
+                token_auto_refresh.stream_started()
             try:
-                accumulated_text = ""
                 # Kimi 的工具响应先缓冲完整输出，以拦截上游的“内置工具禁用”拒绝语。
-                is_tool_stream = bool(tools and "kimi" in model_name.lower())
                 pending_tail = ""  # 尾部保留区：防止探针词被 chunk 边界拆开漏检
                 HOLD = 15
                 for parsed in call_upstream_stream(payload):
@@ -1116,6 +1175,7 @@ def chat_completions():
                         if not should_think:
                             delta.pop("reasoning_content", None)
                         content_piece = delta.get("content", "") or ""
+                        streamed_chars += len(content_piece)
                         full_piece = pending_tail + content_piece
                         pending_tail = ""
 
@@ -1279,7 +1339,27 @@ def chat_completions():
                         yield f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n"
 
                 yield "data: [DONE]\n\n"
+                _log_ts(
+                    f"[stream] 完成: model={model_name} 用时 {time.time() - t0:.1f}s"
+                    f" 输出 {streamed_chars} 字 tool_stream={is_tool_stream}"
+                )
+                if TOKEN_AUTO_REFRESH_AVAILABLE:
+                    token_auto_refresh.stream_ended()
+            except GeneratorExit:
+                _log_ts(
+                    f"[stream] 客户端中断: model={model_name} 用时 {time.time() - t0:.1f}s"
+                    f" 已输出 {streamed_chars} 字"
+                )
+                if TOKEN_AUTO_REFRESH_AVAILABLE:
+                    token_auto_refresh.stream_ended()
+                raise
             except Exception as ex:
+                _log_ts(
+                    f"[stream] 上游错误: model={model_name} "
+                    f"{type(ex).__name__}: {str(ex)[:150]}"
+                )
+                if TOKEN_AUTO_REFRESH_AVAILABLE:
+                    token_auto_refresh.stream_ended()
                 err_chunk = {
                     "error": {
                         "message": f"Proxy upstream error: {str(ex)}",
@@ -1466,6 +1546,12 @@ if __name__ == "__main__":
 
     # 2. 只有真实端口完全确定后，才打印 Banner，保证界面显示的地址与实际运行绝对一致！
     print_banner(actual_port=actual_port)
+
+    # 2.5 启动凭据自动刷新后台服务（Token 过期/临近过期时自动续期）
+    if TOKEN_AUTO_REFRESH_AVAILABLE:
+        token_auto_refresh.start_background()
+    else:
+        print("   [token] 自动刷新模块不可用（token_auto_refresh.py 缺失或依赖不足）。")
 
     # 3. 绑定并启动生产级 WSGI 服务器
     if WAITRESS_AVAILABLE:

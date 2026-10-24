@@ -11,6 +11,7 @@
 - **多模态**：图片理解（`image_url`，支持 Base64 与远程 URL）、PDF 文档问答（`type: file`）。
 - **额外入口**：文生图 `/v1/images/generations`、文字转语音 `/v1/audio/speech`、语音转文字 `/v1/audio/transcriptions`。
 - **零配置刷新凭据**：`get_token.bat` 自动打开独立浏览器窗口，登录后自动提取并验证凭据，无需 F12。
+- **凭据自动续期**：服务内置后台守护，Token 过期前 2 小时自动通过专用浏览器静默续期（SSO 会话存活时全程零交互）。若 SSO 会话也失效，可创建 `credentials.txt`（格式见 `credentials.txt.example`）实现全自动登录；未配置时保持浏览器窗口打开并弹窗提醒手动登录。
 - **生产级服务**：Waitress WSGI + 智能端口检测（占用时自动避让并在启动窗口如实显示）。
 - **安全默认值**：远程图片默认禁止访问本机/内网地址；请求体与图片大小有上限；上游认证失效时返回明确的 HTTP 503 而不是空回复。
 
@@ -81,7 +82,7 @@ client.chat.completions.create(
 
 ## 运维
 
-- **查看状态**：`GET /health`，其中 `upstream_auth` 应为 `valid`；若为 `expired` / `missing`，运行 `get_token.bat` 更新凭据后重启。
+- **查看状态**：`GET /health`，其中 `upstream_auth` 应为 `valid`；若为 `expired` / `missing`，后台会自动触发续期（需浏览器窗口登录一次），或手动运行 `get_token.bat`。
 - **模型列表**：`GET /v1/models`。
 - **指定端口**：`start.bat 8080` 或环境变量 `PORT`。
 - **可调环境变量**：`PROXY_API_KEY`（访问密钥）、`PROXY_MAX_REQUEST_BYTES`（请求体上限，默认 32 MiB）、`PROXY_MAX_IMAGE_BYTES`（远程图片上限，默认 20 MiB）、`ALLOW_PRIVATE_IMAGE_URLS=1`（允许远程图片访问内网，默认禁止）。
@@ -96,6 +97,7 @@ client.chat.completions.create(
 | `get_token.py` / `get_token.bat` | 凭据自动获取工具 |
 | `start.bat` / `install_deps.bat` | 一键启动 / 一键装依赖 |
 | `token.txt` | **你的**登录凭据（首次获取时生成；已在 `.gitignore` 中，绝不会提交） |
+| `token_auto_refresh.py` | 凭据自动续期后台服务 |
 | `SECURITY.md` | 部署、凭据与网络安全说明 |
 | `test_tool_calling.py` | 离线回归测试 |
 

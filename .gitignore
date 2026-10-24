@@ -1,17 +1,11 @@
-# 凭据与本地运行产物（绝不提交）
-token.txt
-token_*.txt
-*.zip
-*.log
-
-# Python
 __pycache__/
 *.py[cod]
+*.log
 .pytest_cache/
 .ruff_cache/
-.venv/
-venv/
+token*.txt
+*.zip
 
-# 编辑器
-.idea/
-.vscode/
+# 本地自动登录凭据（绝不提交）
+credentials.txt
+token.txt.tmp

@@ -187,6 +187,59 @@ def allowed_tool_names(tools: List[Dict[str, Any]]) -> Optional[set]:
 
 
 # ---------------------------------------------------------------------------
+# Kimi k3 原生信封（改编自 OwenxuSH/shanghaitech-kimi-gateway，学校 Kimi-K3 的部署原生格式）
+# ---------------------------------------------------------------------------
+
+K3_ACTION_RE = re.compile(r"<k3_action>\s*(.*?)\s*</k3_action>", re.IGNORECASE | re.DOTALL)
+K3_FINAL_RE = re.compile(r"<k3_final>\s*(.*?)\s*</k3_final>", re.IGNORECASE | re.DOTALL)
+
+
+def build_k3_prompt(tools: List[Dict[str, Any]]) -> str:
+    """Kimi-K3 原生动作信封协议（学校部署的训练格式，遵循度最高）。"""
+    definitions = [
+        {"name": (t.get("function") or {}).get("name"),
+         "description": (t.get("function") or {}).get("description", ""),
+         "parameters": (t.get("function") or {}).get("parameters", {})}
+        for t in tools if isinstance(t, dict)
+    ]
+    return (
+        "Client action protocol. Use an action envelope for external work and a "
+        "final envelope for the answer. Return no prose outside an envelope. "
+        "An action is JSON with name and arguments.\n"
+        "<k3_tools>" + json.dumps(definitions, ensure_ascii=False, separators=(",", ":")) + "</k3_tools>\n"
+        '<k3_action>{"name":"tool","arguments":{}}</k3_action>\n'
+        "<k3_final>answer</k3_final>"
+    )
+
+
+def _extract_k3_calls(text: str, allowed=None):
+    if "<k3_action>" not in text.lower():
+        return None
+    calls = []
+    for m in K3_ACTION_RE.finditer(text):
+        try:
+            value = json.loads(m.group(1).strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        name = _clean_tool_name(str(value.get("name", "")))
+        if not name or (allowed and name not in allowed):
+            continue
+        args = value.get("arguments", {})
+        if not isinstance(args, dict):
+            continue
+        calls.append(_make_call(name, args))
+    return calls or None
+
+
+def _clean_k3_text(text: str) -> Optional[str]:
+    visible = K3_ACTION_RE.sub("", text)
+    visible = K3_FINAL_RE.sub(lambda m: m.group(1), visible).strip()
+    return visible or None
+
+
+# ---------------------------------------------------------------------------
 # 解析链（改编自 jollyxenon/shanghaitech-genai2api tools/parsing.py）
 # ---------------------------------------------------------------------------
 
@@ -221,6 +274,7 @@ _LEAK_TOKEN_RE = re.compile(
     r"|<\|tool_calls_begin\|>|<\|tool_calls_end\|>"
     r"|</?message>|</?tool_info>|<dic>[^<]*</dic>"
     r"|</?parameter>|</?arguments>|</?tool_call>|</?tool_calls>"
+    r"|</?k3_action>|</?k3_final>|</?k3_tools>"
 )
 
 

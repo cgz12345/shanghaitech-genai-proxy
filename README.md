@@ -9,12 +9,13 @@
 - **完整 OpenAI Chat Completions**：流式（SSE）与非流式，`/v1/models` 动态枚举。
 - **Agent 工具调用（Function Calling）**：支持 `tools` / `tool_choice` 与旧版 `functions` / `function_call`，包括流式 `delta.tool_calls` 与工具结果回传；可把网页模型生成的各种工具调用格式（含 Qwen 私有标记）统一转换为标准结构。
 - **多模态**：图片理解（`image_url`，支持 Base64 与远程 URL）、PDF 文档问答（`type: file`）。
-- **额外入口**：文生图 `/v1/images/generations`、文字转语音 `/v1/audio/speech`、语音转文字 `/v1/audio/transcriptions`、**Anthropic Messages `/v1/messages`**（Claude Code / Claude 系客户端原生可用，含流式与 tool_use）、单模型查询 `/v1/models/{id}`、存活检查 `/healthz`。
+- **额外入口**：文生图 `/v1/images/generations`、文字转语音 `/v1/audio/speech`、语音转文字 `/v1/audio/transcriptions`、**Anthropic Messages `/v1/messages`**（Claude Code / Claude 系客户端原生可用，含流式与 tool_use）、**OpenAI Responses `/v1/responses`**（Codex CLI 可用，含流式事件与 function_call/custom_tool_call）、单模型查询 `/v1/models/{id}`、存活检查 `/healthz`。
 - **零配置刷新凭据**：`get_token.bat` 自动打开独立浏览器窗口，登录后自动提取并验证凭据，无需 F12。
 - **凭据自动续期**：服务内置后台守护，Token 过期前 2 小时自动通过专用浏览器静默续期（SSO 会话存活时全程零交互）。若 SSO 会话也失效，可创建 `credentials.txt`（格式见 `credentials.txt.example`）实现全自动登录；未配置时保持浏览器窗口打开并弹窗提醒手动登录。
 - **生产级服务**：Waitress WSGI + 智能端口检测（占用时自动避让并在启动窗口如实显示）。
 - **并发限制队列**（学习 XV2004）：`PROXY_MAX_CONCURRENCY`（默认 4）限制同时进行的上游对话，超出排队；排队超 `PROXY_QUEUE_TIMEOUT`（默认 300s）返回 429。
-- **诊断与基准工具**（学习 jollyxenon）：`python bench.py --doctor` 一键体检；`python bench.py` 测各模型 TTFT 与解码速度。
+- **诊断与基准工具**（学习 jollyxenon）：`python bench.py --doctor` 一键体检；`python bench.py` 测各模型 TTFT 与解码速度；`python context_probe.py --model <名>` 实测各模型有效上下文上限（ZEBRA 标记复述法）。
+- **Kimi 原生信封**（学习 OwenxuSH/shanghaitech-kimi-gateway）：Kimi 系模型使用学校部署原生的 `<k3_action>`/`<k3_final>` 动作信封协议，工具调用遵循度最高。
 - **Docker 加固部署**（学习 Blue-Flag-666）：只读根文件系统、`cap-drop ALL`、`no-new-privileges`、非 root 用户、healthcheck，见 `compose.yaml`。
 - **CI**（学习 Blue-Flag-666）：GitHub Actions 离线测试矩阵（Ubuntu/Windows × Python 3.10/3.12），不触网。
 - **安全默认值**：远程图片默认禁止访问本机/内网地址；请求体与图片大小有上限；上游认证失效时返回明确的 HTTP 503 而不是空回复。

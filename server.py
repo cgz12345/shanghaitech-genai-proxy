@@ -48,6 +48,7 @@ try:
         extract_tool_calls,
         clean_leak_tokens,
         strip_tools_prompt_echo,
+        build_k3_prompt,
         allowed_tool_names,
     )
 
@@ -655,6 +656,314 @@ def _anthropic_stream(internal_url, openai_req):
                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                "usage": {"output_tokens": usage_out}})
     yield _sse("message_stop", {"type": "message_stop"})
+
+
+
+
+# ---------------- OpenAI Responses API 适配（事件模型学习 jollyxenon） ----------------
+
+def _responses_to_openai(req):
+    """Responses 请求 -> 内部 OpenAI Chat 请求。"""
+    out = {
+        "model": req.get("model", "gpt-6-astra"),
+        "max_tokens": req.get("max_output_tokens") or 4096,
+        "stream": bool(req.get("stream")),
+    }
+    messages = []
+    instructions = req.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        messages.append({"role": "system", "content": instructions})
+
+    items = req.get("input")
+    if isinstance(items, str):
+        items = [{"type": "message", "role": "user", "content": items}]
+    if not isinstance(items, list):
+        items = []
+
+    for item in items:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        t = item.get("type") or "message"
+        if t == "message":
+            role = item.get("role", "user")
+            if role == "developer":
+                role = "system"
+            if role not in ("user", "assistant", "system"):
+                role = "user"
+            messages.append({"role": role, "content": item.get("content", "")})
+        elif t == "function_call":
+            messages.append({
+                "role": "assistant", "content": None,
+                "tool_calls": [{
+                    "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {"name": item.get("name", ""),
+                                 "arguments": item.get("arguments") or "{}"},
+                }],
+            })
+        elif t == "custom_tool_call":
+            messages.append({
+                "role": "assistant", "content": None,
+                "tool_calls": [{
+                    "id": item.get("call_id") or f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {"name": item.get("name", ""),
+                                 "arguments": json.dumps({"input": item.get("input", "")}, ensure_ascii=False)},
+                }],
+            })
+        elif t in ("function_call_output", "custom_tool_call_output"):
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id", "call_x"),
+                "content": str(item.get("output") or ""),
+            })
+        # reasoning / item_reference 历史项不回传上游
+    out["messages"] = messages
+
+    tools, custom_names = [], set()
+    for t in req.get("tools") or []:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function":
+            tools.append({"type": "function", "function": {
+                "name": t.get("name", ""),
+                "description": t.get("description", ""),
+                "parameters": t.get("parameters", {}) or {"type": "object", "properties": {}},
+            }})
+        elif t.get("type") == "custom":
+            # custom 工具映射为单参数函数（学习 jollyxenon 的处理方式）
+            name = t.get("name", "")
+            custom_names.add(name)
+            tools.append({"type": "function", "function": {
+                "name": name,
+                "description": t.get("description", ""),
+                "parameters": {"type": "object",
+                               "properties": {"input": {"type": "string"}},
+                               "required": ["input"]},
+            }})
+    if tools:
+        out["tools"] = tools
+    tc = req.get("tool_choice")
+    if tc in ("auto", "none"):
+        out["tool_choice"] = tc
+    elif isinstance(tc, dict) and tc.get("type") in ("function", "custom"):
+        out["tool_choice"] = {"type": "function", "function": {"name": tc.get("name")}}
+    return out, custom_names
+
+
+def _responses_base(resp_id, model, status, output):
+    return {
+        "id": resp_id, "object": "response", "created_at": int(time.time()),
+        "status": status, "model": model, "output": output,
+        "parallel_tool_calls": True, "tool_choice": "auto",
+        "tools": [], "error": None, "incomplete_details": None,
+        "instructions": None, "metadata": {}, "usage": None,
+        "temperature": 1.0, "top_p": 1.0,
+    }
+
+
+def _openai_to_responses_object(body, custom_names, resp_id, instructions, tools_meta):
+    choice = (body.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) or {}
+    output = []
+    text = msg.get("content")
+    if text:
+        output.append({
+            "id": "msg_" + uuid.uuid4().hex[:12], "type": "message",
+            "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        })
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            args = {}
+        if name in custom_names:
+            output.append({
+                "id": "ctc_" + uuid.uuid4().hex[:12], "type": "custom_tool_call",
+                "status": "completed", "call_id": tc.get("id", ""), "name": name,
+                "input": args.get("input", ""),
+            })
+        else:
+            output.append({
+                "id": "fc_" + uuid.uuid4().hex[:12], "type": "function_call",
+                "status": "completed", "call_id": tc.get("id", ""), "name": name,
+                "arguments": fn.get("arguments") or "{}",
+            })
+    resp = _responses_base(resp_id, body.get("model", ""), "completed", output)
+    resp["instructions"] = instructions
+    resp["tools"] = tools_meta
+    usage = body.get("usage") or {}
+    if usage:
+        resp["usage"] = {
+            "input_tokens": usage.get("prompt_tokens", 0) or 0,
+            "output_tokens": usage.get("completion_tokens", 0) or 0,
+            "total_tokens": usage.get("total_tokens", 0) or 0,
+        }
+    return resp
+
+
+def _responses_stream(internal_url, openai_req, custom_names, resp_id, instructions, tools_meta):
+    """内部 OpenAI SSE -> Responses SSE 事件流。"""
+    H = {"Authorization": "Bearer " + LOCAL_API_KEY, "Content-Type": "application/json",
+         "X-Proxy-Internal": "1"}
+
+    def ev(name, data):
+        return "event: %s\ndata: %s\n\n" % (name, json.dumps(data, ensure_ascii=False))
+
+    base = _responses_base(resp_id, openai_req.get("model", ""), "in_progress", [])
+    base["instructions"] = instructions
+    base["tools"] = tools_meta
+    yield ev("response.created", {"type": "response.created", "response": base, "sequence_number": 0})
+
+    msg_started = False
+    text_acc = ""
+    output_items = []
+    seq = 1
+
+    with httpx.stream("POST", internal_url, headers=H,
+                      json=dict(openai_req, stream=True),
+                      timeout=httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=60.0),
+                      verify=False) as r:
+        if r.status_code != 200:
+            body = r.read().decode("utf-8", errors="ignore")[:200]
+            yield ev("response.failed", {"type": "response.failed",
+                     "response": dict(base, status="failed", error={"code": None, "message": body})})
+            return
+        for line in r.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            d = line[5:].strip()
+            if d == "[DONE]":
+                break
+            try:
+                p = json.loads(d)
+            except Exception:
+                continue
+            ch_list = p.get("choices") or []
+            if not ch_list:
+                continue
+            ch = ch_list[0]
+            delta = ch.get("delta", {}) or {}
+            piece = delta.get("content") or ""
+            tcs = delta.get("tool_calls")
+            if piece:
+                if not msg_started:
+                    msg_started = True
+                    item_id = "msg_" + uuid.uuid4().hex[:12]
+                    yield ev("response.output_item.added", {"type": "response.output_item.added",
+                             "output_index": 0, "sequence_number": seq,
+                             "item": {"id": item_id, "type": "message", "status": "in_progress",
+                                      "role": "assistant", "content": []}})
+                    seq += 1
+                text_acc += piece
+                yield ev("response.output_text.delta", {"type": "response.output_text.delta",
+                         "item_id": item_id, "output_index": 0, "sequence_number": seq,
+                         "delta": piece})
+                seq += 1
+            if tcs:
+                if msg_started:
+                    yield ev("response.output_text.done", {"type": "response.output_text.done",
+                             "item_id": item_id, "output_index": 0, "sequence_number": seq, "text": text_acc})
+                    seq += 1
+                    yield ev("response.output_item.done", {"type": "response.output_item.done",
+                             "output_index": 0, "sequence_number": seq,
+                             "item": {"id": item_id, "type": "message", "status": "completed",
+                                      "role": "assistant",
+                                      "content": [{"type": "output_text", "text": text_acc, "annotations": []}]}})
+                    seq += 1
+                    output_items.append({"id": item_id, "type": "message", "status": "completed",
+                                         "role": "assistant",
+                                         "content": [{"type": "output_text", "text": text_acc, "annotations": []}]})
+                    msg_started = False
+                for tc in tcs:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    call_id = tc.get("id", "")
+                    if name in custom_names:
+                        item = {"id": "ctc_" + uuid.uuid4().hex[:12], "type": "custom_tool_call",
+                                "status": "completed", "call_id": call_id, "name": name,
+                                "input": (fn.get("arguments") or "").strip('"')}
+                        yield ev("response.output_item.added", {"type": "response.output_item.added",
+                                 "output_index": len(output_items), "sequence_number": seq,
+                                 "item": dict(item, status="in_progress", input="")})
+                        seq += 1
+                        yield ev("response.output_item.done", {"type": "response.output_item.done",
+                                 "output_index": len(output_items), "sequence_number": seq, "item": item})
+                        seq += 1
+                    else:
+                        args_json = fn.get("arguments") or "{}"
+                        item = {"id": "fc_" + uuid.uuid4().hex[:12], "type": "function_call",
+                                "status": "completed", "call_id": call_id, "name": name,
+                                "arguments": args_json}
+                        yield ev("response.output_item.added", {"type": "response.output_item.added",
+                                 "output_index": len(output_items), "sequence_number": seq,
+                                 "item": dict(item, status="in_progress", arguments="")})
+                        seq += 1
+                        yield ev("response.function_call_arguments.delta", {
+                                 "type": "response.function_call_arguments.delta",
+                                 "item_id": item["id"], "output_index": len(output_items),
+                                 "sequence_number": seq, "delta": args_json})
+                        seq += 1
+                        yield ev("response.output_item.done", {"type": "response.output_item.done",
+                                 "output_index": len(output_items), "sequence_number": seq, "item": item})
+                        seq += 1
+                    output_items.append(item)
+    if msg_started:
+        yield ev("response.output_text.done", {"type": "response.output_text.done",
+                 "item_id": item_id, "output_index": 0, "sequence_number": seq, "text": text_acc})
+        seq += 1
+        yield ev("response.output_item.done", {"type": "response.output_item.done",
+                 "output_index": 0, "sequence_number": seq,
+                 "item": {"id": item_id, "type": "message", "status": "completed",
+                          "role": "assistant",
+                          "content": [{"type": "output_text", "text": text_acc, "annotations": []}]}})
+        seq += 1
+        output_items.append({"id": item_id, "type": "message", "status": "completed",
+                             "role": "assistant",
+                             "content": [{"type": "output_text", "text": text_acc, "annotations": []}]})
+    done = dict(base, status="completed", output=output_items)
+    yield ev("response.completed", {"type": "response.completed", "response": done, "sequence_number": seq})
+
+
+@app.route("/v1/responses", methods=["POST"])
+def openai_responses():
+    """OpenAI Responses API 端点（Codex CLI 兼容子集）。"""
+    req = request.get_json(force=True, silent=True) or {}
+    if "input" not in req:
+        return jsonify({"error": {"message": "Missing 'input' field", "type": "invalid_request_error",
+                                  "param": "input", "code": None}}), 400
+    openai_req, custom_names = _responses_to_openai(req)
+    internal = "http://127.0.0.1:%d/v1/chat/completions" % ACTUAL_PORT
+    resp_id = "resp_" + uuid.uuid4().hex[:16]
+    if req.get("stream"):
+        def gen():
+            for chunk in _responses_stream(internal, openai_req, custom_names, resp_id,
+                                           req.get("instructions"), req.get("tools") or []):
+                yield chunk
+        resp = Response(gen(), mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+    H = {"Authorization": "Bearer " + LOCAL_API_KEY, "Content-Type": "application/json",
+         "X-Proxy-Internal": "1"}
+    try:
+        r = httpx.post(internal, headers=H, json=openai_req, timeout=600.0, verify=False)
+    except httpx.HTTPError as exc:
+        return jsonify({"error": {"message": f"internal call failed: {exc}", "type": "api_error"}}), 502
+    if r.status_code != 200:
+        try:
+            detail = (r.json().get("error") or {}).get("message")
+        except Exception:
+            detail = r.text[:150]
+        return jsonify({"error": {"message": detail or f"internal {r.status_code}",
+                                  "type": "api_error"}}), r.status_code
+    return jsonify(_openai_to_responses_object(
+        r.json(), custom_names, resp_id, req.get("instructions"), req.get("tools") or []))
 
 
 @app.route("/v1/messages", methods=["POST"])
@@ -1434,9 +1743,11 @@ def chat_completions():
     if tools and TOOL_ENGINE_AVAILABLE:
         # 协议必须位于用户任务之前。Kimi 等模型会拒绝末尾追加的“假装调用工具”指令，
         # 但能可靠地遵循“序列化请求，由外部程序执行”的明确协议。
-        protocol = build_tools_system_prompt(
-            tools, tool_choice, routing_only="kimi" in model_name.lower()
-        )
+        if "kimi" in model_name.lower():
+            # Kimi-K3：学校部署原生的 k3 动作信封（OwenxuSH/shanghaitech-kimi-gateway 验证）
+            protocol = build_k3_prompt(tools)
+        else:
+            protocol = build_tools_system_prompt(tools, tool_choice)
         protocol_text = protocol
         chat_info = f"{protocol}\n\n<user_request>\n{chat_info}\n</user_request>"
 
@@ -1573,6 +1884,7 @@ def chat_completions():
                             or '{"tool_calls' in full_piece
                             or "调用工具" in full_piece
                             or "DSML" in full_piece
+                            or "<k3_" in full_piece
                         ):
                             is_tool_stream = True
                             accumulated_text += full_piece

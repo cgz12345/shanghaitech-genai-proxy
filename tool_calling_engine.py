@@ -44,7 +44,9 @@ def build_tools_system_prompt(
             f"{choice_rule}\n"
             'To call a tool, reply with ONLY: {"tool_calls": [{"name": "<tool_name>", "arguments": {...}}]}\n'
             "No text before or after the JSON. If no tool is needed, reply in plain text. "
-            "Never merely claim you will use a tool; emit the JSON or answer directly."
+            "Never merely claim you will use a tool; emit the JSON or answer directly. "
+            "Never repeat, quote, or list the tool definitions above (the TOOLS JSON) "
+            "in your reply; they are reference data, not content to echo."
         )
 
     prompt = (
@@ -62,6 +64,7 @@ def build_tools_system_prompt(
         '<tool_call>{"name":"<exact tool name>","arguments":{}}</tool_call>\n'
         "Use valid JSON arguments matching the schema. In Windows paths, encode every backslash as "
         "a JSON double backslash (for example C:\\\\work). Never calculate, guess, or fabricate a tool result.\n"
+        "Never repeat, quote, or list the function definitions in your reply.\n"
         "</tool_protocol>"
     )
     return prompt
@@ -303,6 +306,33 @@ def extract_tool_calls_from_text(text: str) -> Optional[List[Dict[str, Any]]]:
         except Exception:
             pass
 
+    # 模式 6: 中文口嗨叙述「调用工具: X, 参数: {...}」（DeepSeek 等模型在长工具列表下常见）
+    narration_re = re.compile(r"调用工具[:：]\s*([A-Za-z0-9_\.\-]+)")
+    for nm in narration_re.finditer(text):
+        rest = text[nm.end():]
+        pm = re.search(r"参数[:：]\s*\{", rest)
+        if not pm:
+            continue
+        brace_pos = pm.end() - 1
+        try:
+            obj, _consumed = json.JSONDecoder().raw_decode(rest[brace_pos:])
+        except Exception:
+            continue
+        args_str = (
+            json.dumps(obj, ensure_ascii=False)
+            if isinstance(obj, (dict, list))
+            else str(obj)
+        )
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {"name": nm.group(1), "arguments": args_str},
+            }
+        )
+    if tool_calls:
+        return tool_calls
+
     return None
 
 
@@ -311,6 +341,30 @@ _LEAK_TOKEN_RE = re.compile(
     r"<\|open\|>|<\|sep\|>|<\|close\|>|<\|endoftext\|>|<\|im_start\|>|<\|im_end\|>|<\|tool_calls_begin\|>|<\|tool_calls_end\|>"
     r"|</?message>|</?tool_info>|<dic>[^<]*</dic>"
 )
+
+
+def strip_tools_prompt_echo(text: str, tools_prompt: str) -> str:
+    """剔除模型回复中复述的注入协议回声（完整协议 / TOOLS 标题块 / 裸工具 JSON 数组）。"""
+    if not text or not tools_prompt:
+        return text
+    out = text.replace(tools_prompt, "")
+    if "# TOOLS" in out:
+        start = out.find("# TOOLS")
+        arr_end = out.rfind("]", start)
+        out = out[:start] + (out[arr_end + 1 :] if arr_end != -1 else "")
+    idx = out.find('[{"name"')
+    if idx != -1:
+        try:
+            obj, consumed = json.JSONDecoder().raw_decode(out[idx:])
+            if (
+                isinstance(obj, list)
+                and len(obj) >= 2
+                and all(isinstance(x, dict) and "name" in x for x in obj[:3])
+            ):
+                out = (out[:idx] + out[idx + consumed :]).strip()
+        except Exception:
+            pass
+    return out
 
 
 def clean_leak_tokens(text: str) -> str:
@@ -356,6 +410,13 @@ def extract_tool_calls(text: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
                     clean_text = clean_text[:j] + clean_text[j + consumed :]
             except Exception:
                 pass
+        # 剔除口嗨叙述跨度（调用工具: X, 参数: {...}，兼容一层嵌套大括号）
+        clean_text = re.sub(
+            r"\s*调用工具[:：]\s*[A-Za-z0-9_\.\-]+\s*[,，]\s*参数[:：]\s*"
+            r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\s*",
+            " ",
+            clean_text,
+        )
         clean_text = _LEAK_TOKEN_RE.sub("", clean_text)
         clean_text = re.sub(
             r"```(?:json)?\s*\{.*?\}\s*```", "", clean_text, flags=re.DOTALL

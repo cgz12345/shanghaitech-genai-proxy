@@ -47,6 +47,7 @@ try:
         build_tools_system_prompt,
         extract_tool_calls,
         clean_leak_tokens,
+        strip_tools_prompt_echo,
     )
 
     TOOL_ENGINE_AVAILABLE = True
@@ -1212,6 +1213,7 @@ def chat_completions():
                             or "```" in full_piece
                             or '"tool_calls"' in full_piece
                             or '{"tool_calls' in full_piece
+                            or "调用工具" in full_piece
                         ):
                             is_tool_stream = True
                             accumulated_text += full_piece
@@ -1445,6 +1447,8 @@ def chat_completions():
                 finish_reason = "tool_calls"
             else:
                 full_content = clean_leak_tokens(full_content)
+            if protocol_text and full_content:
+                full_content = strip_tools_prompt_echo(full_content, protocol_text)
         elif TOOL_ENGINE_AVAILABLE:
             # 即使客户端未显式提供 tools，也清理可能漏出的开源模型原生私有标记
             full_content = clean_leak_tokens(full_content)

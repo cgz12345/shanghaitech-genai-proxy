@@ -1038,9 +1038,17 @@ def is_tool_refusal(text: str) -> bool:
 
 
 # 宣告型拖延检测：模型说"我先查一下/我来处理"但既不调工具也不提问就结束回合
-STALL_ANNOUNCE_RE = re.compile(
-    r"(我先|我来|我将|让我|接下来|首先|现在来|我先查|我来查|我先看|我来试"
-    r"|let me|i will|i'll|first,? i)",
+# 意图宣告（我会先/我先/我将/接下来/let me 等一切"宣告将要做"的变体）
+STALL_INTENT_RE = re.compile(
+    r"([我让咱].{0,8}(先|来|去|会|将|要|准备|打算)"
+    r"|接下来|首先|下一步|然后(再|会|去)"
+    r"|let me|i'll|i will|i'm going to|first,? i)",
+    re.IGNORECASE,
+)
+# 未来动作词（宣告里必须提到对数据/文件/环境的动作，避免把"我先总结：答案42"误杀）
+STALL_ACTION_RE = re.compile(
+    r"(获取|查|检查|研究|尝试|运行|执行|读取|下载|批量|继续|开始|打开|访问|搜索|编写|创建|绘制|生成|处理|分析"
+    r"|fetch|pull|check|search|run|read|write|create|build|download|plot|draw|generate|try|start|continue)",
     re.IGNORECASE,
 )
 
@@ -1051,7 +1059,9 @@ def is_stall_announcement(text: str) -> bool:
     stripped = text.strip()
     if len(stripped) > 200 or "?" in stripped or "？" in stripped:
         return False
-    return bool(STALL_ANNOUNCE_RE.search(stripped[:80]))
+    return bool(
+        STALL_INTENT_RE.search(stripped[:80]) and STALL_ACTION_RE.search(stripped)
+    )
 
 
 def forced_tool_routing_payload(

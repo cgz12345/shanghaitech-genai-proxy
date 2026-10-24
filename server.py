@@ -1452,6 +1452,8 @@ def chat_completions():
             if TOKEN_AUTO_REFRESH_AVAILABLE:
                 token_auto_refresh.stream_started()
             slot_held = False
+            upstream_events = 0
+            upstream_reasoning_events = 0
             try:
                 slot_held = _acquire_chat_slot(internal_call)
             except _QueueFullError:
@@ -1478,6 +1480,9 @@ def chat_completions():
                                 delta  # 关键：保证 delta 是 parsed 内的真引用，修改才能随序列化发出
                             )
                         # 未显式要求思考时，剔除学校模型自带的内置思维链，保持客户端界面干净
+                        upstream_events += 1
+                        if delta.get("reasoning_content"):
+                            upstream_reasoning_events += 1
                         if not should_think:
                             fallback_reasoning += delta.get("reasoning_content") or ""
                             delta.pop("reasoning_content", None)
@@ -1652,6 +1657,8 @@ def chat_completions():
                 _log_ts(
                     f"[stream] 完成: model={model_name} 用时 {time.time() - t0:.1f}s"
                     f" 输出 {streamed_chars} 字 tool_stream={is_tool_stream}"
+                    f" tool_calls={emitted_tool_calls} 兜底思考={len(fallback_reasoning)}字"
+                    f" 事件={upstream_events} 思考事件={upstream_reasoning_events}"
                 )
                 if TOKEN_AUTO_REFRESH_AVAILABLE:
                     token_auto_refresh.stream_ended()

@@ -259,9 +259,14 @@ def fetch_shanghaitech_models() -> list:
 
 
 def find_model_config(model_id: str) -> Dict[str, Any]:
+    """按模型配置匹配：同时接受学校内部 ID（aiType）与网页显示名（aiName），大小写不敏感。"""
     models = fetch_shanghaitech_models()
+    wanted = (model_id or "").strip().lower()
     for m in models:
-        if m.get("aiType") == model_id:
+        if str(m.get("aiType") or "").strip().lower() == wanted:
+            return m
+    for m in models:
+        if str(m.get("aiName") or "").strip().lower() == wanted:
             return m
     if models:
         return {}
@@ -357,15 +362,15 @@ def list_models():
     openai_models = []
     if raw_models:
         for m in raw_models:
-            model_id = m.get("aiType")
+            display_name = (m.get("aiName") or "").strip() or m.get("aiType")
             openai_models.append(
                 {
-                    "id": model_id,
+                    "id": display_name,
                     "object": "model",
                     "created": 1700000000,
                     "owned_by": m.get("rootAiType", "shanghaitech"),
                     "permission": [],
-                    "root": model_id,
+                    "root": m.get("aiType"),
                     "parent": None,
                     "capabilities": {
                         "chat": str(m.get("status")) in ("1", "3"),
@@ -1421,13 +1426,14 @@ def print_banner(actual_port: int):
     if models:
         print(f'   可用模型 ({len(models)} 个)，填入客户端"模型名"即可调用:')
         for m in models:
-            mid = m.get("aiType", "?")
+            display = (m.get("aiName") or "").strip() or m.get("aiType", "?")
             vendor = m.get("rootAiType", "?")
             vision = "识图:是" if str(m.get("status")) == "3" else "识图:否"
             think = " 思考:按需" if str(m.get("enableDeepThink")) == "1" else ""
-            print(f"     - {mid:<18} [{vendor:<10}] {vision}{think}")
+            print(f"     - {display:<26} [{vendor:<10}] {vision}{think}")
         print()
-        print('   说明: 所有模型默认极速直出；带"思考:按需"的模型，')
+        print("   说明: 模型名与网页端显示一致；内部 ID（如 deepseek-pro）也可用。")
+        print("         所有模型默认极速直出；带\"思考:按需\"的模型，")
         print("         仅当客户端显式传入 thinking/effort 参数时才启用深度思考。")
     else:
         print("   [!] 暂时无法获取模型列表（Token 未配置 / 失效，或网络问题）")

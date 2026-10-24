@@ -983,6 +983,15 @@ def call_upstream_stream(payload: Dict[str, Any]) -> Generator[dict, None, None]
                             "upstream returned no chat choices; refresh token or check model availability"
                         )
                     return
+        except RuntimeError as exc:
+            msg = str(exc)
+            transient = ("暂时不可用" in msg) or ("稍后重试" in msg)
+            if transient and not got_any and attempt < max_ttft_retries:
+                _log_ts(f"[stream] 上游瞬时过载({msg[:30]}…)，3 秒后自动重试 {attempt + 1}/{max_ttft_retries}")
+                time.sleep(3)
+                last_error = exc
+                continue
+            raise
         except (
             httpx.ReadTimeout,
             httpx.ConnectError,

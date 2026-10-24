@@ -220,6 +220,7 @@ _LEAK_TOKEN_RE = re.compile(
     r"<\|open\|>|<\|sep\|>|<\|close\|>|<\|endoftext\|>|<\|im_start\|>|<\|im_end\|>"
     r"|<\|tool_calls_begin\|>|<\|tool_calls_end\|>"
     r"|</?message>|</?tool_info>|<dic>[^<]*</dic>"
+    r"|</?parameter>|</?arguments>|</?tool_call>|</?tool_calls>"
 )
 
 

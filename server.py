@@ -1100,12 +1100,14 @@ def chat_completions():
     tool_choice = req_data.get("tool_choice", req_data.get("function_call", "auto"))
     if tool_choice == "none":
         tools = []
+    protocol_text = ""
     if tools and TOOL_ENGINE_AVAILABLE:
         # 协议必须位于用户任务之前。Kimi 等模型会拒绝末尾追加的“假装调用工具”指令，
         # 但能可靠地遵循“序列化请求，由外部程序执行”的明确协议。
         protocol = build_tools_system_prompt(
             tools, tool_choice, routing_only="kimi" in model_name.lower()
         )
+        protocol_text = protocol
         chat_info = f"{protocol}\n\n<user_request>\n{chat_info}\n</user_request>"
 
     # 深度思考控制（严格对齐网页端）
@@ -1154,6 +1156,8 @@ def chat_completions():
             t0 = time.time()
             accumulated_text = ""
             streamed_chars = 0
+            fallback_reasoning = ""  # 被剥离的内置思考：空回复时作为兜底交付
+            emitted_tool_calls = False
             is_tool_stream = bool(tools and "kimi" in model_name.lower())
             _log_ts(f"[stream] 开始: model={model_name} stream=True tools={len(tools or [])}")
             if TOKEN_AUTO_REFRESH_AVAILABLE:
@@ -1174,6 +1178,7 @@ def chat_completions():
                             )
                         # 未显式要求思考时，剔除学校模型自带的内置思维链，保持客户端界面干净
                         if not should_think:
+                            fallback_reasoning += delta.get("reasoning_content") or ""
                             delta.pop("reasoning_content", None)
                         content_piece = delta.get("content", "") or ""
                         streamed_chars += len(content_piece)
@@ -1282,6 +1287,8 @@ def chat_completions():
                                 retry_delta = retry_choices[0].get("delta", {}) or {}
                                 accumulated_text += retry_delta.get("content", "") or ""
                     clean_text, tool_calls = extract_tool_calls(accumulated_text)
+                    if protocol_text and clean_text:
+                        clean_text = strip_tools_prompt_echo(clean_text, protocol_text) or None
                     if tool_calls:
                         # 先发模型的前置说明文字（如有），再发工具调用
                         if clean_text:
@@ -1452,6 +1459,39 @@ def chat_completions():
         elif TOOL_ENGINE_AVAILABLE:
             # 即使客户端未显式提供 tools，也清理可能漏出的开源模型原生私有标记
             full_content = clean_leak_tokens(full_content)
+
+        # ---- 空回复恢复：绝不给客户端静默空消息 ----
+        if not full_content and not tool_calls:
+            if thinking_content:
+                full_content = thinking_content
+                finish_reason = "stop"
+                _log_ts(
+                    f"[nostream] 空回复兜底: 交付内置思考 {len(thinking_content)} 字"
+                )
+            elif tools and TOOL_ENGINE_AVAILABLE:
+                _log_ts("[nostream] 空回复恢复: 强制路由重试一次……")
+                retry_text = ""
+                for ev in call_upstream_stream(
+                    forced_tool_routing_payload(payload, tools, original_chat_info)
+                ):
+                    ch = (ev.get("choices") or [{}])[0]
+                    retry_text += (ch.get("delta", {}) or {}).get("content", "") or ""
+                clean2, calls2 = extract_tool_calls(retry_text)
+                if calls2:
+                    tool_calls = calls2
+                    full_content = clean2 or None
+                    finish_reason = "tool_calls"
+                    _log_ts("[nostream] 空回复恢复: 重试产出 tool_calls ✓")
+                elif clean2:
+                    full_content = clean2
+                    _log_ts(f"[nostream] 空回复恢复: 重试产出正文 {len(clean2)} 字 ✓")
+            if not full_content and not tool_calls:
+                return jsonify({
+                    "error": {
+                        "message": "Upstream returned an empty response twice; model may be overloaded. Please retry.",
+                        "type": "server_error",
+                    }
+                }), 502
 
         message_obj = {"role": "assistant", "content": full_content}
         if tool_calls:

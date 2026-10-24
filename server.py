@@ -1037,6 +1037,23 @@ def is_tool_refusal(text: str) -> bool:
     return bool(text and TOOL_REFUSAL_RE.search(text))
 
 
+# 宣告型拖延检测：模型说"我先查一下/我来处理"但既不调工具也不提问就结束回合
+STALL_ANNOUNCE_RE = re.compile(
+    r"(我先|我来|我将|让我|接下来|首先|现在来|我先查|我来查|我先看|我来试"
+    r"|let me|i will|i'll|first,? i)",
+    re.IGNORECASE,
+)
+
+
+def is_stall_announcement(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    stripped = text.strip()
+    if len(stripped) > 200 or "?" in stripped or "？" in stripped:
+        return False
+    return bool(STALL_ANNOUNCE_RE.search(stripped[:80]))
+
+
 def forced_tool_routing_payload(
     payload: Dict[str, Any], tools: List[Dict[str, Any]], user_text: str
 ) -> Dict[str, Any]:
@@ -1447,6 +1464,8 @@ def chat_completions():
             t0 = time.time()
             accumulated_text = ""
             streamed_chars = 0
+            streamed_text = ""
+            _stream_dbg = []
             fallback_reasoning = ""  # 被剥离的内置思考：空回复时作为兜底交付
             emitted_tool_calls = False
             is_tool_stream = bool(tools and "kimi" in model_name.lower())
@@ -1490,6 +1509,10 @@ def chat_completions():
                             delta.pop("reasoning_content", None)
                         content_piece = delta.get("content", "") or ""
                         streamed_chars += len(content_piece)
+                        if len(streamed_text) < 2000:
+                            streamed_text += content_piece
+                        if os.environ.get("PROXY_DEBUG_STREAM") == "1" and content_piece and streamed_chars <= 400:
+                            _stream_dbg.append(content_piece)
                         full_piece = pending_tail + content_piece
                         pending_tail = ""
 
@@ -1741,12 +1764,50 @@ def chat_completions():
                         yield f"data: {json.dumps(err_empty, ensure_ascii=False)}\n\n"
                         _log_ts("[stream] 空回复: 恢复失败，已发 error 事件")
 
+                # ---- 宣告型拖延恢复（学习 Blue-Flag output-repair）："我先查一下"却不调工具 ----
+                if (
+                    not emitted_tool_calls
+                    and streamed_chars > 0
+                    and tools
+                    and TOOL_ENGINE_AVAILABLE
+                    and is_stall_announcement(streamed_text)
+                ):
+                    _log_ts(f"[stream] 宣告型拖延: {streamed_text[:60]!r} -> 强制路由重试")
+                    retry_text = ""
+                    for ev in call_upstream_stream(
+                        forced_tool_routing_payload(payload, tools, original_chat_info)
+                    ):
+                        ch_r = (ev.get("choices") or [{}])[0]
+                        retry_text += (ch_r.get("delta", {}) or {}).get("content", "") or ""
+                    clean_s, calls_s = extract_tool_calls(
+                        retry_text, tools_present=True, allowed_names=_allowed_names
+                    )
+                    if calls_s:
+                        idx_s = [dict(c, index=i) for i, c in enumerate(calls_s)]
+                        tch_s = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": upstream_model or model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "tool_calls": idx_s},
+                                "finish_reason": "tool_calls",
+                            }],
+                        }
+                        yield f"data: {json.dumps(tch_s, ensure_ascii=False)}\n\n"
+                        emitted_tool_calls = True
+                        _log_ts(f"[stream] 宣告恢复: 重试产出 {len(calls_s)} 个 tool_calls ✓")
+                    else:
+                        _log_ts("[stream] 宣告恢复: 重试未产出工具调用，保留原回复")
+
                 yield "data: [DONE]\n\n"
                 _log_ts(
                     f"[stream] 完成: model={model_name} 用时 {time.time() - t0:.1f}s"
                     f" 输出 {streamed_chars} 字 tool_stream={is_tool_stream}"
                     f" tool_calls={emitted_tool_calls} 兜底思考={len(fallback_reasoning)}字"
                     f" 事件={upstream_events} 思考事件={upstream_reasoning_events}"
+                    + (f" 内容={repr(''.join(_stream_dbg)[:200])}" if os.environ.get("PROXY_DEBUG_STREAM") == "1" and _stream_dbg else "")
                 )
                 if TOKEN_AUTO_REFRESH_AVAILABLE:
                     token_auto_refresh.stream_ended()
@@ -1906,6 +1967,32 @@ def chat_completions():
                         "type": "server_error",
                     }
                 }), 502
+
+        # ---- 宣告型拖延恢复（非流式）："我先查一下"却不调工具 ----
+        if (
+            not tool_calls
+            and full_content
+            and tools
+            and TOOL_ENGINE_AVAILABLE
+            and is_stall_announcement(full_content)
+        ):
+            _log_ts(f"[nostream] 宣告型拖延: {str(full_content)[:60]!r} -> 强制路由重试")
+            retry_text = ""
+            for ev in call_upstream_stream(
+                forced_tool_routing_payload(payload, tools, original_chat_info)
+            ):
+                ch_r = (ev.get("choices") or [{}])[0]
+                retry_text += (ch_r.get("delta", {}) or {}).get("content", "") or ""
+            clean_s, calls_s = extract_tool_calls(
+                retry_text, tools_present=True, allowed_names=_allowed_names
+            )
+            if calls_s:
+                tool_calls = calls_s
+                full_content = clean_s or None
+                finish_reason = "tool_calls"
+                _log_ts(f"[nostream] 宣告恢复: 重试产出 {len(calls_s)} 个 tool_calls ✓")
+            else:
+                _log_ts("[nostream] 宣告恢复: 重试未产出工具调用，保留原回复")
 
         message_obj = {"role": "assistant", "content": full_content}
         if tool_calls:

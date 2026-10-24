@@ -1060,6 +1060,9 @@ def forced_tool_routing_payload(
     retried = dict(payload)
     protocol = build_tools_system_prompt(tools, "required", routing_only=True)
     retried["chatInfo"] = f"{protocol}\n\n<user_request>\n{user_text}\n</user_request>"
+    # 清空历史：会话历史（含此前的拖延/污染轮次）会诱导模型继续拖延；
+    # 路由协议 + 用户请求已含决策所需的全部信息（实测空历史下模型稳定输出 <tool_call>）
+    retried["messages"] = []
     return retried
 
 
@@ -1782,6 +1785,7 @@ def chat_completions():
                     clean_s, calls_s = extract_tool_calls(
                         retry_text, tools_present=True, allowed_names=_allowed_names
                     )
+                    _log_ts(f"[stream] 宣告恢复重试原文: {retry_text[:150]!r}")
                     if calls_s:
                         idx_s = [dict(c, index=i) for i, c in enumerate(calls_s)]
                         tch_s = {

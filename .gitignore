@@ -9,3 +9,6 @@ token*.txt
 # 本地自动登录凭据（绝不提交）
 credentials.txt
 token.txt.tmp
+
+# 本地弹窗节流状态（运行时生成）
+.token_prompt_state

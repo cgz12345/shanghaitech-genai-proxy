@@ -36,9 +36,11 @@ CREDENTIALS_FILE = BASE_DIR / "credentials.txt"
 CHECK_INTERVAL_SECONDS = 30 * 60          # 常规巡检间隔
 EXPIRY_MARGIN_SECONDS = 2 * 3600          # 距过期不足 2 小时即续期（token 有效期约 24h）
 LOGIN_WAIT_SECONDS = 300                  # 单次续期最长等待（等 SSO 跳转/用户输入）
-REPROMPT_SECONDS = 3600                   # 需要人工登录时的重复弹窗间隔
+REPROMPT_SECONDS = 6 * 3600               # 需要人工登录时的重复弹窗间隔
+PROMPT_STATE_FILE = BASE_DIR / ".token_prompt_state"   # 上次弹窗时间（跨重启/多实例共享）
 
 _state_lock = threading.Lock()
+_popup_thread = None                       # 当前存活的弹窗线程（不点不消失，防堆积）
 _active_streams = 0                        # 正在进行的流式响应数（续期需等待其结束）
 _refresh_lock = threading.Lock()
 _last_user_prompt = 0.0
@@ -94,7 +96,7 @@ def _click_by_text(ws_url: str, texts) -> bool:
     expr = """(() => {
       const els = [...document.querySelectorAll('button, a, span[role=button]')];
       for (const want of %s) {
-        const b = els.find(e => (e.innerText||'').replace(/\\\\s/g,'').includes(want));
+        const b = els.find(e => (e.innerText||'').replace(/ /g,'').includes(want));
         if (b) { b.click(); return 'clicked:' + want; }
       }
       return 'notfound';
@@ -117,25 +119,92 @@ def _fill_sso_form(ws_url: str, user: str, pwd: str) -> bool:
         el.dispatchEvent(new Event('input', {bubbles: true}));
         el.dispatchEvent(new Event('change', {bubbles: true}));
       };
-      if (u.value) return 'already-filled';
-      set(u, %s); set(p, %s);
-      return 'filled';
+      // 用户名常被浏览器/CAS 预填：只补空字段，不能因此跳过密码和提交
+      let acted = false;
+      if (!u.value) { set(u, %s); acted = true; }
+      if (!p.value) { set(p, %s); acted = true; }
+      return acted ? 'filled' : 'already-filled';
     })()""" % (json.dumps(user), json.dumps(pwd))
     try:
-        return _cdp_eval(ws_url, expr) == "filled"
+        return _cdp_eval(ws_url, expr) in ("filled", "already-filled")
+    except Exception:
+        return False
+
+
+def _submit_sso_form(ws_url: str) -> bool:
+    """点击登录提交按钮（兼容不同 CAS 模板）。"""
+    expr = """(() => {
+      const direct = document.querySelector('#login_submit, button[type=submit], input[type=submit]');
+      if (direct) { direct.click(); return 'clicked'; }
+      const els = [...document.querySelectorAll('button, a, span[role=button]')];
+      const btn = els.find(e => {
+        const t = (e.innerText||'').replace(/ /g,'');
+        return t === '登录' || t === '登陆' || t.toLowerCase() === 'login' || t.toLowerCase() === 'signin';
+      });
+      if (btn) { btn.click(); return 'clicked'; }
+      return 'notfound';
+    })()"""
+    try:
+        return _cdp_eval(ws_url, expr) == "clicked"
+    except Exception:
+        return False
+
+
+def _load_last_prompt() -> float:
+    """读取上次弹窗时间（落盘，重启服务不会立刻再弹）。"""
+    try:
+        return float(PROMPT_STATE_FILE.read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0.0
+
+
+def _save_last_prompt(ts: float) -> None:
+    try:
+        PROMPT_STATE_FILE.write_text(str(ts), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_POPUP_MUTEX_NAME = "Local\\ShanghaiTechGenAIProxy_TokenPrompt"
+
+
+def _popup_exists(title: str) -> bool:
+    """检查是否已有同标题弹窗（含其他进程或旧版本创建的）。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.FindWindowW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        return bool(user32.FindWindowW(None, title))
     except Exception:
         return False
 
 
 def _notify_user(title: str, message: str) -> None:
-    """非阻塞弹窗提醒（独立线程，避免卡住刷新循环）。"""
+    """非阻塞弹窗提醒。跨进程同一时间只允许一个弹窗，杜绝堆积。"""
+    global _popup_thread
+    if _popup_thread is not None and _popup_thread.is_alive():
+        return  # 本进程已有弹窗，跳过
     def _show():
         try:
             import ctypes
-            ctypes.windll.user32.MessageBoxW(0, message, title, 0x40)
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = kernel32.CreateMutexW(None, False, _POPUP_MUTEX_NAME)
+            already = kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+            try:
+                if already or _popup_exists(title):
+                    return  # 其他实例的弹窗还开着
+                ctypes.windll.user32.MessageBoxW(0, message, title, 0x40)
+            finally:
+                if handle:
+                    kernel32.CloseHandle(handle)
         except Exception:
             pass
-    threading.Thread(target=_show, daemon=True).start()
+    _popup_thread = threading.Thread(target=_show, daemon=True)
+    _popup_thread.start()
 
 
 def refresh_once(max_wait: int = LOGIN_WAIT_SECONDS):
@@ -176,9 +245,9 @@ def refresh_once(max_wait: int = LOGIN_WAIT_SECONDS):
             if "genai.shanghaitech.edu.cn" in url and "/user/login" in url:
                 if _click_by_text(ws, ["重新登录"]):
                     time.sleep(1.5)
-                _click_by_text(ws, ["统一身份认证登录"])
+                if not sso_clicked:
+                    sso_clicked = _click_by_text(ws, ["统一身份认证登录"])
                 _click_by_text(ws, ["确 认", "确认"])
-                sso_clicked = True
 
             # 3) SSO 表单页：填账号密码（如配置了凭据）
             if "ids.shanghaitech.edu.cn" in url:
@@ -188,12 +257,9 @@ def refresh_once(max_wait: int = LOGIN_WAIT_SECONDS):
                         form_filled = True
                         _log("SSO 表单已自动填写")
                 if form_filled and not submitted:
-                    try:
-                        _cdp_eval(ws, "document.querySelector('#login_submit')?.click()")
+                    if _submit_sso_form(ws):
                         submitted = True
                         _log("SSO 表单已提交，等待跳转……")
-                    except Exception:
-                        pass
 
         time.sleep(1)
 
@@ -229,6 +295,8 @@ def _attempt_refresh_cycle():
             _log("获取到的 Token 未通过上游验证，放弃保存。")
             return False
         gt.save_token(token)
+        _last_user_prompt = 0.0
+        _save_last_prompt(0.0)  # 续期成功，下次真过期时立即提醒
         expiry = gt.decode_expiry(token)
         expiry_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expiry)) if expiry else "未知"
         _log(f"✓ Token 自动续期成功，新凭据有效期至 {expiry_text}")
@@ -238,13 +306,21 @@ def _attempt_refresh_cycle():
     expired = needs_refresh_force_expired()
     if expired:
         now = time.time()
-        if now - _last_user_prompt > REPROMPT_SECONDS:
+        last_prompt = max(_last_user_prompt, _load_last_prompt())
+        if now - last_prompt > REPROMPT_SECONDS:
             _last_user_prompt = now
+            _save_last_prompt(now)
+            user, pwd = _read_credentials()
+            reason = (
+                "已尝试用 credentials.txt 自动登录，但未能完成（可能遇到验证码或页面变更）。"
+                if user and pwd else "未找到 credentials.txt，无法自动登录。"
+            )
             _notify_user(
                 "GenAI 凭据需要手动登录",
-                "自动续期未能完成（SSO 会话已失效且未配置自动登录）。\n\n"
+                f"Token 已过期，自动续期未能完成。\n{reason}\n\n"
                 "已打开的浏览器窗口中，请完成学校统一身份认证登录，\n"
-                "登录成功后凭据会自动保存，无需其他操作。",
+                "登录成功后凭据会自动保存，无需其他操作。\n"
+                "（此提示窗可直接关闭，服务会自动等待您登录。）",
             )
             _log("需要人工登录：请在打开的浏览器窗口中完成登录（窗口保持打开）。")
     else:
@@ -297,8 +373,10 @@ def _loop():
     if not gt.find_browsers():
         _log("未找到 Chrome/Edge，自动刷新不可用。")
         return
+    kicked = True  # 启动后立即检查一次，避免带着过期 Token 空等 30 分钟
     while True:
-        kicked = _kick_event.wait(timeout=CHECK_INTERVAL_SECONDS)
+        if not kicked:
+            kicked = _kick_event.wait(timeout=CHECK_INTERVAL_SECONDS)
         _kick_event.clear()
         with _refresh_lock:
             try:
@@ -307,6 +385,7 @@ def _loop():
                     _attempt_refresh_cycle()
             except Exception:
                 _log("续期循环异常: " + traceback.format_exc(limit=3))
+        kicked = False
 
 
 def start_background() -> None:

@@ -7,6 +7,7 @@ from server import (
     app,
     extract_multimodal_parts,
     get_token_expiry,
+    is_stall_announcement,
     is_tool_refusal,
     validate_remote_url,
 )
@@ -121,6 +122,21 @@ class ToolCallingTests(unittest.TestCase):
             is_tool_refusal("I can't invoke the filesystem tool in this turn.")
         )
         self.assertFalse(is_tool_refusal("The directory contains three files."))
+
+    def test_stall_announcement_catches_look_then_load(self):
+        # 实测事故原文：模型只宣告"先看一下/然后加载"，不调工具就结束回合
+        self.assertTrue(
+            is_stall_announcement(
+                "我来做一个 3D 鹦鹉骑车的交互式场景。先看一下工作目录情况，然后加载可视化技能。"
+            )
+        )
+        self.assertTrue(is_stall_announcement("Let me take a look at the files."))
+        self.assertTrue(is_stall_announcement("I'll check the repository first."))
+
+    def test_stall_announcement_ignores_plain_answers(self):
+        self.assertFalse(is_stall_announcement("答案是 42。"))
+        self.assertFalse(is_stall_announcement("我先总结：答案是 42。"))
+        self.assertFalse(is_stall_announcement("需要我继续吗？"))
 
     def test_jwt_expiry_is_read_without_exposing_token(self):
         payload = json.dumps({"exp": 2000000000}).encode()

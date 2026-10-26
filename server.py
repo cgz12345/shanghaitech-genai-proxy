@@ -1364,9 +1364,18 @@ STALL_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 # 未来动作词（宣告里必须提到对数据/文件/环境的动作，避免把"我先总结：答案42"误杀）
+# 注意覆盖"先看一下/加载/做一个/实现/搭一个"这类最常见的口嗨起手式
 STALL_ACTION_RE = re.compile(
-    r"(获取|查|检查|研究|尝试|运行|执行|读取|下载|批量|继续|开始|打开|访问|搜索|编写|创建|绘制|生成|处理|分析"
-    r"|fetch|pull|check|search|run|read|write|create|build|download|plot|draw|generate|try|start|continue)",
+    r"(获取|查询|查看|查(?!找)|检查|研究|尝试|运行|执行|读取|下载|批量|继续|开始|打开|访问|搜索"
+    r"|编写|创建|绘制|生成|处理|分析|整理|浏览|扫描|调试|部署|提交|推送|安装|配置|验证|确认"
+    r"|看(一下|下|看|一眼)|做(一个|个|一下|下|点|成|好|出来|完)"
+    r"|加载|了解(一下|下)?|实现|搭(一个|个|建|起来)|建(一个|个|立|模)"
+    r"|改(一下|下|成|动)|修(一下|下|复|改)|写(一个|个|一下|下|点|完)"
+    r"|跑(一下|下|起来|一遍)|测(一下|下|试)|搜(一下|下|索)|找(一下|下|到|找)"
+    r"|fetch|pull|check|search|run|read|write|create|build|download|plot|draw|generate|try|start|continue"
+    r"|take a look|look at|load|inspect|explore|find|modify|edit|update|refactor|implement|test|fix"
+    r"|add|remove|delete|install|set ?up|examine|investigate|verify|validate|measure|benchmark|debug"
+    r"|deploy|commit|push|render|make|do)",
     re.IGNORECASE,
 )
 
@@ -1801,6 +1810,8 @@ def chat_completions():
             _stream_dbg = []
             fallback_reasoning = ""  # 被剥离的内置思考：空回复时作为兜底交付
             emitted_tool_calls = False
+            final_finish_reason = None  # 上游 finish_reason 先扣住，恢复逻辑跑完再发
+            final_emitted = False       # 是否已有最终 finish_reason chunk
             is_tool_stream = bool(tools and "kimi" in model_name.lower())
             _log_ts(f"[stream] 开始: model={model_name} stream=True tools={len(tools or [])}")
             if TOKEN_AUTO_REFRESH_AVAILABLE:
@@ -1833,6 +1844,8 @@ def chat_completions():
                             ch0["delta"] = (
                                 delta  # 关键：保证 delta 是 parsed 内的真引用，修改才能随序列化发出
                             )
+                        if delta.get("tool_calls"):
+                            emitted_tool_calls = True
                         # 未显式要求思考时，剔除学校模型自带的内置思维链，保持客户端界面干净
                         upstream_events += 1
                         if delta.get("reasoning_content"):
@@ -1898,15 +1911,19 @@ def chat_completions():
                                 full_piece = cleaned
                         finish_now = choices[0].get("finish_reason")
                         if finish_now:
-                            # 结束 chunk：合并尾部保留区立即转发，确保 finish_reason 不丢
+                            # 先扣住 finish_reason：宣告/空回复恢复可能还要补发工具调用，
+                            # 提前发 stop 会让客户端在 tool_calls 到达前就结束回合。
+                            final_finish_reason = finish_now
                             merged = pending_tail + full_piece
                             if merged:
                                 delta["content"] = merged
                             pending_tail = ""
-                            try:
-                                yield f"data: {json.dumps(parsed, ensure_ascii=False)}\n\n"
-                            except Exception:
-                                continue
+                            choices[0]["finish_reason"] = None
+                            if delta:
+                                try:
+                                    yield f"data: {json.dumps(parsed, ensure_ascii=False)}\n\n"
+                                except Exception:
+                                    pass
                         elif len(full_piece) > HOLD:
                             # 足够长：转发扣除尾部保留区之外的部分
                             pending_tail = full_piece[-HOLD:]
@@ -2000,6 +2017,7 @@ def chat_completions():
                             ],
                         }
                         yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
+                        final_emitted = True
                     elif clean_text:
                         text_chunk = {
                             "id": completion_id,
@@ -2015,6 +2033,7 @@ def chat_completions():
                             ],
                         }
                         yield f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n"
+                        final_emitted = True
 
                 # ---- 流式空回复恢复（与非流式对称）：绝不给客户端静默空消息 ----
                 if streamed_chars == 0 and not emitted_tool_calls:
@@ -2032,6 +2051,7 @@ def chat_completions():
                             }],
                         }
                         yield f"data: {json.dumps(rec_chunk, ensure_ascii=False)}\n\n"
+                        final_emitted = True
                         recovered = True
                         _log_ts(f"[stream] 空回复兜底: 交付内置思考 {len(fallback_reasoning)} 字")
                     elif tools and TOOL_ENGINE_AVAILABLE:
@@ -2070,6 +2090,7 @@ def chat_completions():
                                 }],
                             }
                             yield f"data: {json.dumps(tch2, ensure_ascii=False)}\n\n"
+                            final_emitted = True
                             emitted_tool_calls = True
                             recovered = True
                             _log_ts("[stream] 空回复恢复: 重试产出 tool_calls ✓")
@@ -2086,6 +2107,7 @@ def chat_completions():
                                 }],
                             }
                             yield f"data: {json.dumps(rec2, ensure_ascii=False)}\n\n"
+                            final_emitted = True
                             recovered = True
                             _log_ts(f"[stream] 空回复恢复: 重试产出正文 {len(clean2)} 字 ✓")
                     if not recovered and streamed_chars == 0 and not emitted_tool_calls:
@@ -2131,10 +2153,31 @@ def chat_completions():
                             }],
                         }
                         yield f"data: {json.dumps(tch_s, ensure_ascii=False)}\n\n"
+                        final_emitted = True
                         emitted_tool_calls = True
                         _log_ts(f"[stream] 宣告恢复: 重试产出 {len(calls_s)} 个 tool_calls ✓")
                     else:
                         _log_ts("[stream] 宣告恢复: 重试未产出工具调用，保留原回复")
+
+                # 所有恢复逻辑结束后，只发一个最终 finish_reason；
+                # 避免先 stop 后 tool_calls 导致客户端提前收尾。
+                if not final_emitted:
+                    final_reason = (
+                        "tool_calls" if emitted_tool_calls
+                        else (final_finish_reason or "stop")
+                    )
+                    final_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": upstream_model or model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": final_reason,
+                        }],
+                    }
+                    yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
 
                 yield "data: [DONE]\n\n"
                 _log_ts(

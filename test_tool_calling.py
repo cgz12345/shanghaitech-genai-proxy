@@ -11,6 +11,7 @@ from server import (
     app,
     extract_multimodal_parts,
     get_token_expiry,
+    hoist_system_messages,
     is_tool_refusal,
     parse_action_verdict,
     validate_remote_url,
@@ -138,6 +139,24 @@ class ToolCallingTests(unittest.TestCase):
         self.assertFalse(parse_action_verdict("ANSWER"))
         self.assertFalse(parse_action_verdict("answer."))
         self.assertIsNone(parse_action_verdict("maybe"))
+
+    def test_system_messages_are_hoisted_into_chat_info(self):
+        chat_info, msgs = hoist_system_messages(
+            "user text",
+            [
+                {"role": "system", "content": "sys A"},
+                {"role": "system", "content": "sys B"},
+                {"role": "user", "content": "user text"},
+            ],
+        )
+        self.assertEqual("sys A\n\nsys B\n\nuser text", chat_info)
+        self.assertEqual([{"role": "user", "content": "user text"}], msgs)
+
+        chat_info2, msgs2 = hoist_system_messages(
+            "u", [{"role": "user", "content": "u"}]
+        )
+        self.assertEqual("u", chat_info2)
+        self.assertEqual([{"role": "user", "content": "u"}], msgs2)
 
     def test_tool_prompt_requires_immediate_action(self):
         prompt = build_tools_system_prompt(TOOLS)

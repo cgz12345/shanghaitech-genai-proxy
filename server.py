@@ -1128,6 +1128,22 @@ def extract_multimodal_parts(
     return chat_info, plain_messages, image_refs, file_items
 
 
+def hoist_system_messages(
+    chat_info: str, plain_messages: List[Dict[str, str]]
+) -> Tuple[str, List[Dict[str, str]]]:
+    """学校后端对 role=system 不稳定：并入 chatInfo，messages 只留 user/assistant。"""
+    system_texts = [
+        str(m.get("content") or "").strip()
+        for m in plain_messages
+        if m.get("role") == "system"
+    ]
+    system_texts = [t for t in system_texts if t]
+    if not system_texts:
+        return chat_info, plain_messages
+    remaining = [m for m in plain_messages if m.get("role") != "system"]
+    return "\n\n".join(system_texts + [chat_info]), remaining
+
+
 def upload_image_to_genai(image_ref: str) -> Tuple[str, int, int]:
     """将图片 (data URL 或 http URL) 转存到上科大图片服务器，返回 (静态URL, width, height)"""
     if image_ref.startswith("data:"):
@@ -1370,17 +1386,24 @@ def build_continuation_payload(
     """文本收尾但未声明完成时，保留历史并强制模型执行第一步。"""
     cont = dict(payload)
     messages = list(payload.get("messages") or [])
-    messages.append({"role": "assistant", "content": assistant_text})
+    if assistant_text.strip():
+        messages.append({"role": "assistant", "content": assistant_text})
     cont["messages"] = messages
     routing = build_tools_system_prompt(tools, "required", routing_only=True)
+    previous_note = (
+        "<previous_assistant_message>\n"
+        + assistant_text
+        + "\n</previous_assistant_message>\n"
+        + "The previous assistant message only announced an intention and executed nothing. "
+        if assistant_text.strip()
+        else "The previous attempt produced no output at all.\n"
+    )
     cont["chatInfo"] = (
         routing
         + "\n\n<user_request>\n"
         + (user_text or "")
-        + "\n</user_request>\n\n<previous_assistant_message>\n"
-        + assistant_text
-        + "\n</previous_assistant_message>\n"
-        + "The previous assistant message only announced an intention and executed nothing. "
+        + "\n</user_request>\n\n"
+        + previous_note
         + "Execute the first step of the user's request now by emitting exactly one routing record. "
         + "Do not reply with prose and do not claim the task is complete."
     )
@@ -1836,6 +1859,9 @@ def chat_completions():
             chat_info = "你好"
     original_chat_info = chat_info
 
+    # 学校后端对 role=system 处理不稳定：98 个工具时 system+user 会直接返回空响应。
+    chat_info, plain_messages = hoist_system_messages(chat_info, plain_messages)
+
     # 工具调用（Tools / Function Calling）支持
     # 注意：学校后端会忽略 role=system 的消息，工具指令必须拼进 chatInfo（核心字段）才能被模型看到
     tools = req_data.get("tools") or []
@@ -2122,6 +2148,7 @@ def chat_completions():
                         }
                         yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
                         final_emitted = True
+                        emitted_tool_calls = True
                     elif clean_text:
                         text_chunk = {
                             "id": completion_id,
@@ -2159,15 +2186,15 @@ def chat_completions():
                         recovered = True
                         _log_ts(f"[stream] 空回复兜底: 交付内置思考 {len(fallback_reasoning)} 字")
                     elif tools and TOOL_ENGINE_AVAILABLE:
-                        _log_ts("[stream] 空回复恢复: 强制路由重试一次……")
-                        retry_text = ""
-                        for ev in call_upstream_stream(
-                            forced_tool_routing_payload(payload, tools, original_chat_info)
-                        ):
-                            ch_r = (ev.get("choices") or [{}])[0]
-                            retry_text += (ch_r.get("delta", {}) or {}).get("content", "") or ""
-                        clean2, calls2 = extract_tool_calls(retry_text, tools_present=True)
-                        clean2 = strip_final_marker(clean2 or "")
+                        _log_ts("[stream] 空回复恢复: 带完整历史强制续问一次……")
+                        try:
+                            clean2, calls2, _ = run_continuation(
+                                payload, "", _allowed_names,
+                                tools, original_chat_info,
+                            )
+                        except Exception as exc:
+                            _log_ts(f"[stream] 空回复恢复失败: {exc}")
+                            clean2, calls2 = "", []
                         if calls2:
                             if clean2:
                                 pre2 = {
@@ -2198,7 +2225,7 @@ def chat_completions():
                             final_emitted = True
                             emitted_tool_calls = True
                             recovered = True
-                            _log_ts("[stream] 空回复恢复: 重试产出 tool_calls ✓")
+                            _log_ts(f"[stream] 空回复恢复: 续问产出 {len(calls2)} 个 tool_calls ✓")
                         elif clean2:
                             rec2 = {
                                 "id": completion_id,
@@ -2214,7 +2241,7 @@ def chat_completions():
                             yield f"data: {json.dumps(rec2, ensure_ascii=False)}\n\n"
                             final_emitted = True
                             recovered = True
-                            _log_ts(f"[stream] 空回复恢复: 重试产出正文 {len(clean2)} 字 ✓")
+                            _log_ts(f"[stream] 空回复恢复: 续问产出正文 {len(clean2)} 字 ✓")
                     if not recovered and streamed_chars == 0 and not emitted_tool_calls:
                         err_empty = {
                             "error": {
@@ -2457,22 +2484,22 @@ def chat_completions():
                     f"[nostream] 空回复兜底: 交付内置思考 {len(thinking_content)} 字"
                 )
             elif tools and TOOL_ENGINE_AVAILABLE:
-                _log_ts("[nostream] 空回复恢复: 强制路由重试一次……")
-                retry_text = ""
-                for ev in call_upstream_stream(
-                    forced_tool_routing_payload(payload, tools, original_chat_info)
-                ):
-                    ch = (ev.get("choices") or [{}])[0]
-                    retry_text += (ch.get("delta", {}) or {}).get("content", "") or ""
-                clean2, calls2 = extract_tool_calls(retry_text, tools_present=True)
+                _log_ts("[nostream] 空回复恢复: 带完整历史强制续问一次……")
+                try:
+                    clean2, calls2, _ = run_continuation(
+                        payload, "", _allowed_names, tools, original_chat_info
+                    )
+                except Exception as exc:
+                    _log_ts(f"[nostream] 空回复恢复失败: {exc}")
+                    clean2, calls2 = "", []
                 if calls2:
                     tool_calls = calls2
                     full_content = clean2 or None
                     finish_reason = "tool_calls"
-                    _log_ts("[nostream] 空回复恢复: 重试产出 tool_calls ✓")
+                    _log_ts(f"[nostream] 空回复恢复: 续问产出 {len(calls2)} 个 tool_calls ✓")
                 elif clean2:
                     full_content = clean2
-                    _log_ts(f"[nostream] 空回复恢复: 重试产出正文 {len(clean2)} 字 ✓")
+                    _log_ts(f"[nostream] 空回复恢复: 续问产出正文 {len(clean2)} 字 ✓")
             if not full_content and not tool_calls:
                 return jsonify({
                     "error": {

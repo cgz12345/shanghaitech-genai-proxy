@@ -17,6 +17,16 @@ from typing import Any, Dict, List, Optional, Tuple
 # 提示词（学习 jollyxenon：XML 定义 + 常用工具真实示例 + 实战规则）
 # ---------------------------------------------------------------------------
 
+FINAL_MARKER = "[[FINAL]]"
+
+
+def strip_final_marker(text: str) -> str:
+    """移除模型回传的完成标记（客户端不应看到）。"""
+    if not text:
+        return text
+    return text.replace(FINAL_MARKER, "").rstrip()
+
+
 TOOL_SYSTEM_PROMPT = """\
 You have access to the following tools:
 
@@ -34,12 +44,14 @@ When you need to call a tool, you MUST use the following XML format. Do NOT use 
 
 Rules:
 1. You can call multiple tools by using multiple <tool_call> blocks.
-2. If you don't need any tool, just respond normally in plain text without any <tool_call> tags.
+2. If you don't need any tool, respond normally in plain text and end with the exact marker [[FINAL]].
 3. After receiving tool results, analyze them and either call more tools or give a final answer in plain text.
 4. The "arguments" field MUST be a valid JSON object matching the tool's parameter schema. In Windows paths, escape every backslash as \\\\ (for example C:\\\\work).
 5. NEVER use <arg_key>, <arg_value>, dotted names like Grep.datasource, or a bare tool name.
 6. NEVER wrap <tool_call> in markdown code blocks like ```xml or ```json.
-7. NEVER repeat, quote, or list the tool definitions above in your reply."""
+7. NEVER repeat, quote, or list the tool definitions above in your reply.
+8. NEVER announce future actions ("I will...", "Let me...", "我先..."). If an action is required, call the tool immediately instead of describing it.
+9. The marker [[FINAL]] means the task is fully complete; do not use it if you still need to act."""
 
 TOOL_CHOICE_REQUIRED_PROMPT = (
     "\nYou MUST call at least one tool in your response. Do NOT respond with plain text only."

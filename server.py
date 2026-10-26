@@ -50,11 +50,17 @@ try:
         strip_tools_prompt_echo,
         build_k3_prompt,
         allowed_tool_names,
+        FINAL_MARKER,
+        strip_final_marker,
     )
 
     TOOL_ENGINE_AVAILABLE = True
 except ImportError:
     TOOL_ENGINE_AVAILABLE = False
+    FINAL_MARKER = "[[FINAL]]"
+
+    def strip_final_marker(text):
+        return text.replace(FINAL_MARKER, "").rstrip() if text else text
 
 try:
     import token_auto_refresh
@@ -1355,40 +1361,134 @@ def is_tool_refusal(text: str) -> bool:
     return bool(text and TOOL_REFUSAL_RE.search(text))
 
 
-# 宣告型拖延检测：模型说"我先查一下/我来处理"但既不调工具也不提问就结束回合
-# 意图宣告（我会先/我先/我将/接下来/let me 等一切"宣告将要做"的变体）
-STALL_INTENT_RE = re.compile(
-    r"([我让咱].{0,8}(先|来|去|会|将|要|准备|打算)"
-    r"|接下来|首先|下一步|然后(再|会|去)"
-    r"|let me|i'll|i will|i'm going to|first,? i)",
-    re.IGNORECASE,
-)
-# 未来动作词（宣告里必须提到对数据/文件/环境的动作，避免把"我先总结：答案42"误杀）
-# 注意覆盖"先看一下/加载/做一个/实现/搭一个"这类最常见的口嗨起手式
-STALL_ACTION_RE = re.compile(
-    r"(获取|查询|查看|查(?!找)|检查|研究|尝试|运行|执行|读取|下载|批量|继续|开始|打开|访问|搜索"
-    r"|编写|创建|绘制|生成|处理|分析|整理|浏览|扫描|调试|部署|提交|推送|安装|配置|验证|确认"
-    r"|看(一下|下|看|一眼)|做(一个|个|一下|下|点|成|好|出来|完)"
-    r"|加载|了解(一下|下)?|实现|搭(一个|个|建|起来)|建(一个|个|立|模)"
-    r"|改(一下|下|成|动)|修(一下|下|复|改)|写(一个|个|一下|下|点|完)"
-    r"|跑(一下|下|起来|一遍)|测(一下|下|试)|搜(一下|下|索)|找(一下|下|到|找)"
-    r"|fetch|pull|check|search|run|read|write|create|build|download|plot|draw|generate|try|start|continue"
-    r"|take a look|look at|load|inspect|explore|find|modify|edit|update|refactor|implement|test|fix"
-    r"|add|remove|delete|install|set ?up|examine|investigate|verify|validate|measure|benchmark|debug"
-    r"|deploy|commit|push|render|make|do)",
-    re.IGNORECASE,
-)
-
-
-def is_stall_announcement(text: str) -> bool:
-    if not text or not text.strip():
-        return False
-    stripped = text.strip()
-    if len(stripped) > 200 or "?" in stripped or "？" in stripped:
-        return False
-    return bool(
-        STALL_INTENT_RE.search(stripped[:80]) and STALL_ACTION_RE.search(stripped)
+def build_continuation_payload(
+    payload: Dict[str, Any],
+    assistant_text: str,
+    tools: List[Dict[str, Any]],
+    user_text: str,
+) -> Dict[str, Any]:
+    """文本收尾但未声明完成时，保留历史并强制模型执行第一步。"""
+    cont = dict(payload)
+    messages = list(payload.get("messages") or [])
+    messages.append({"role": "assistant", "content": assistant_text})
+    cont["messages"] = messages
+    routing = build_tools_system_prompt(tools, "required", routing_only=True)
+    cont["chatInfo"] = (
+        routing
+        + "\n\n<user_request>\n"
+        + (user_text or "")
+        + "\n</user_request>\n\n<previous_assistant_message>\n"
+        + assistant_text
+        + "\n</previous_assistant_message>\n"
+        + "The previous assistant message only announced an intention and executed nothing. "
+        + "Execute the first step of the user's request now by emitting exactly one routing record. "
+        + "Do not reply with prose and do not claim the task is complete."
     )
+    return cont
+
+
+def _accumulate_native_calls(
+    buckets: Dict[int, Dict[str, Any]], deltas: List[Dict[str, Any]]
+) -> None:
+    for tc in deltas:
+        if not isinstance(tc, dict):
+            continue
+        index = tc.get("index", 0)
+        slot = buckets.setdefault(
+            index,
+            {
+                "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            },
+        )
+        if tc.get("id"):
+            slot["id"] = tc["id"]
+        fn = tc.get("function") or {}
+        if fn.get("name"):
+            slot["function"]["name"] = fn["name"]
+        if fn.get("arguments"):
+            slot["function"]["arguments"] += fn["arguments"]
+
+
+def run_continuation(
+    payload: Dict[str, Any],
+    assistant_text: str,
+    allowed_names: Optional[set],
+    tools: List[Dict[str, Any]],
+    user_text: str,
+) -> Tuple[str, List[Dict[str, Any]], bool]:
+    """保留历史强制续问一次；返回 (正文, tool_calls, 是否声明完成)。"""
+    text = ""
+    native: Dict[int, Dict[str, Any]] = {}
+    cont_payload = build_continuation_payload(payload, assistant_text, tools, user_text)
+    for ev in call_upstream_stream(cont_payload):
+        ch = (ev.get("choices") or [{}])[0]
+        delta = ch.get("delta") or {}
+        text += delta.get("content") or ""
+        if delta.get("tool_calls") and TOOL_ENGINE_AVAILABLE:
+            _accumulate_native_calls(native, delta["tool_calls"])
+
+    clean = text
+    calls: List[Dict[str, Any]] = []
+    if TOOL_ENGINE_AVAILABLE:
+        clean, calls = extract_tool_calls(
+            text, tools_present=True, allowed_names=allowed_names
+        )
+    for _, tc in sorted(native.items()):
+        native_call = dict(tc)
+        native_call["index"] = len(calls)
+        calls.append(native_call)
+    marker = FINAL_MARKER in text
+    clean = strip_final_marker(clean or "")
+    return clean, calls, marker
+
+
+def parse_action_verdict(text: str) -> Optional[bool]:
+    """ACTION -> True，ANSWER -> False，无法判断 -> None。"""
+    verdict = (text or "").strip().upper()
+    if verdict.startswith("ACTION"):
+        return True
+    if verdict.startswith("ANSWER"):
+        return False
+    if "ACTION" in verdict and "ANSWER" not in verdict:
+        return True
+    if "ANSWER" in verdict and "ACTION" not in verdict:
+        return False
+    return None
+
+
+def classify_reply(
+    payload: Dict[str, Any], user_text: str, assistant_text: str
+) -> Optional[bool]:
+    """用一次极小调用判断：完整答案(False) 还是只说不做(True)。"""
+    user_text = (user_text or "")[:4000]
+    assistant_text = (assistant_text or "")[:4000]
+    prompt = (
+        "You are a strict classifier. Decide whether the assistant reply is a complete final answer "
+        "or only a plan/promise that still requires action.\n\n"
+        f"<user_request>\n{user_text}\n</user_request>\n\n"
+        f"<assistant_reply>\n{assistant_text}\n</assistant_reply>\n\n"
+        "Reply with exactly one word: ANSWER if the reply is a complete final answer and no further "
+        "work is needed; ACTION if the reply only announces or plans future work and has not executed it."
+    )
+    clf = dict(payload)
+    clf["chatInfo"] = prompt
+    clf["messages"] = []
+    clf["maxToken"] = 8
+    clf["stream"] = True
+    clf["thinking"] = False
+    clf["netGo"] = False
+    clf["chatGroupId"] = uuid.uuid4().hex
+    for key in ("imageUrl", "imageUrls", "fileIds", "width", "height"):
+        clf.pop(key, None)
+    text = ""
+    for ev in call_upstream_stream(clf):
+        ch = (ev.get("choices") or [{}])[0]
+        text += (ch.get("delta") or {}).get("content") or ""
+    verdict = parse_action_verdict(text)
+    _log_ts(f"[classify] {text.strip()[:24]!r} -> {verdict}")
+    return verdict
 
 
 def forced_tool_routing_payload(
@@ -1914,7 +2014,7 @@ def chat_completions():
                             # 先扣住 finish_reason：宣告/空回复恢复可能还要补发工具调用，
                             # 提前发 stop 会让客户端在 tool_calls 到达前就结束回合。
                             final_finish_reason = finish_now
-                            merged = pending_tail + full_piece
+                            merged = strip_final_marker(pending_tail + full_piece)
                             if merged:
                                 delta["content"] = merged
                             pending_tail = ""
@@ -1947,9 +2047,11 @@ def chat_completions():
                             {
                                 "index": 0,
                                 "delta": {
-                                    "content": clean_leak_tokens(pending_tail)
-                                    if TOOL_ENGINE_AVAILABLE
-                                    else pending_tail
+                                    "content": strip_final_marker(
+                                        clean_leak_tokens(pending_tail)
+                                        if TOOL_ENGINE_AVAILABLE
+                                        else pending_tail
+                                    )
                                 },
                                 "finish_reason": None,
                             }
@@ -1975,6 +2077,8 @@ def chat_completions():
                     )
                     if protocol_text and clean_text:
                         clean_text = strip_tools_prompt_echo(clean_text, protocol_text) or None
+                    if clean_text:
+                        clean_text = strip_final_marker(clean_text) or None
                     if tool_calls:
                         # 先发模型的前置说明文字（如有），再发工具调用
                         if clean_text:
@@ -2063,6 +2167,7 @@ def chat_completions():
                             ch_r = (ev.get("choices") or [{}])[0]
                             retry_text += (ch_r.get("delta", {}) or {}).get("content", "") or ""
                         clean2, calls2 = extract_tool_calls(retry_text, tools_present=True)
+                        clean2 = strip_final_marker(clean2 or "")
                         if calls2:
                             if clean2:
                                 pre2 = {
@@ -2120,44 +2225,74 @@ def chat_completions():
                         yield f"data: {json.dumps(err_empty, ensure_ascii=False)}\n\n"
                         _log_ts("[stream] 空回复: 恢复失败，已发 error 事件")
 
-                # ---- 宣告型拖延恢复（学习 Blue-Flag output-repair）："我先查一下"却不调工具 ----
+                # ---- 文本收尾但未明确完成：不做措辞/长度猜测，带完整上下文续问一次 ----
                 if (
                     not emitted_tool_calls
+                    and not final_emitted
                     and streamed_chars > 0
                     and tools
                     and TOOL_ENGINE_AVAILABLE
-                    and is_stall_announcement(streamed_text)
+                    and tool_choice_value != "none"
+                    and FINAL_MARKER not in streamed_text
+                    and not is_tool_refusal(streamed_text)
                 ):
-                    _log_ts(f"[stream] 宣告型拖延: {streamed_text[:60]!r} -> 强制路由重试")
-                    retry_text = ""
-                    for ev in call_upstream_stream(
-                        forced_tool_routing_payload(payload, tools, original_chat_info)
-                    ):
-                        ch_r = (ev.get("choices") or [{}])[0]
-                        retry_text += (ch_r.get("delta", {}) or {}).get("content", "") or ""
-                    clean_s, calls_s = extract_tool_calls(
-                        retry_text, tools_present=True, allowed_names=_allowed_names
-                    )
-                    _log_ts(f"[stream] 宣告恢复重试原文: {retry_text[:150]!r}")
-                    if calls_s:
-                        idx_s = [dict(c, index=i) for i, c in enumerate(calls_s)]
-                        tch_s = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": upstream_model or model_name,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"role": "assistant", "tool_calls": idx_s},
-                                "finish_reason": "tool_calls",
-                            }],
-                        }
-                        yield f"data: {json.dumps(tch_s, ensure_ascii=False)}\n\n"
-                        final_emitted = True
-                        emitted_tool_calls = True
-                        _log_ts(f"[stream] 宣告恢复: 重试产出 {len(calls_s)} 个 tool_calls ✓")
+                    _log_ts("[stream] 文本收尾无 [[FINAL]]，先判断是否仍在执行……")
+                    try:
+                        is_action = classify_reply(
+                            payload, original_chat_info, streamed_text
+                        )
+                    except Exception as exc:
+                        _log_ts(f"[stream] 续问分类失败: {exc}")
+                        is_action = None
+                    if is_action is True:
+                        _log_ts("[stream] 判定为未完成动作，强制续问……")
+                        try:
+                            cont_text, cont_calls, cont_marker = run_continuation(
+                                payload, streamed_text, _allowed_names,
+                                tools, original_chat_info,
+                            )
+                        except Exception as exc:
+                            _log_ts(f"[stream] 自动续问失败: {exc}")
+                            cont_text, cont_calls, cont_marker = "", [], False
+                        if cont_calls:
+                            idx_c = [dict(c, index=i) for i, c in enumerate(cont_calls)]
+                            tch_c = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": upstream_model or model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "tool_calls": idx_c},
+                                    "finish_reason": "tool_calls",
+                                }],
+                            }
+                            yield f"data: {json.dumps(tch_c, ensure_ascii=False)}\n\n"
+                            final_emitted = True
+                            emitted_tool_calls = True
+                            _log_ts(f"[stream] 自动续问产出 {len(cont_calls)} 个 tool_calls ✓")
+                        elif (
+                            cont_text
+                            and not cont_marker
+                            and cont_text.strip() != streamed_text.strip()
+                        ):
+                            cch = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": upstream_model or model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": cont_text},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            yield f"data: {json.dumps(cch, ensure_ascii=False)}\n\n"
+                            _log_ts(f"[stream] 自动续问补充正文 {len(cont_text)} 字")
+                        else:
+                            _log_ts("[stream] 自动续问确认任务已结束")
                     else:
-                        _log_ts("[stream] 宣告恢复: 重试未产出工具调用，保留原回复")
+                        _log_ts("[stream] 判定为完成答案，正常结束")
 
                 # 所有恢复逻辑结束后，只发一个最终 finish_reason；
                 # 避免先 stop 后 tool_calls 导致客户端提前收尾。
@@ -2346,31 +2481,52 @@ def chat_completions():
                     }
                 }), 502
 
-        # ---- 宣告型拖延恢复（非流式）："我先查一下"却不调工具 ----
+        # ---- 文本收尾但未明确完成（非流式）：带完整上下文续问一次 ----
         if (
             not tool_calls
             and full_content
             and tools
             and TOOL_ENGINE_AVAILABLE
-            and is_stall_announcement(full_content)
+            and tool_choice_value != "none"
+            and FINAL_MARKER not in str(full_content)
+            and not is_tool_refusal(str(full_content))
         ):
-            _log_ts(f"[nostream] 宣告型拖延: {str(full_content)[:60]!r} -> 强制路由重试")
-            retry_text = ""
-            for ev in call_upstream_stream(
-                forced_tool_routing_payload(payload, tools, original_chat_info)
-            ):
-                ch_r = (ev.get("choices") or [{}])[0]
-                retry_text += (ch_r.get("delta", {}) or {}).get("content", "") or ""
-            clean_s, calls_s = extract_tool_calls(
-                retry_text, tools_present=True, allowed_names=_allowed_names
-            )
-            if calls_s:
-                tool_calls = calls_s
-                full_content = clean_s or None
-                finish_reason = "tool_calls"
-                _log_ts(f"[nostream] 宣告恢复: 重试产出 {len(calls_s)} 个 tool_calls ✓")
+            _log_ts("[nostream] 文本收尾无 [[FINAL]]，先判断是否仍在执行……")
+            try:
+                is_action = classify_reply(
+                    payload, original_chat_info, str(full_content)
+                )
+            except Exception as exc:
+                _log_ts(f"[nostream] 续问分类失败: {exc}")
+                is_action = None
+            if is_action is True:
+                _log_ts("[nostream] 判定为未完成动作，强制续问……")
+                try:
+                    cont_text, cont_calls, cont_marker = run_continuation(
+                        payload, str(full_content), _allowed_names,
+                        tools, original_chat_info,
+                    )
+                except Exception as exc:
+                    _log_ts(f"[nostream] 自动续问失败: {exc}")
+                    cont_text, cont_calls, cont_marker = "", [], False
+                if cont_calls:
+                    tool_calls = cont_calls
+                    finish_reason = "tool_calls"
+                    _log_ts(f"[nostream] 自动续问产出 {len(cont_calls)} 个 tool_calls ✓")
+                elif (
+                    cont_text
+                    and not cont_marker
+                    and cont_text.strip() != str(full_content).strip()
+                ):
+                    full_content = f"{full_content}\n\n{cont_text}"
+                    _log_ts(f"[nostream] 自动续问补充正文 {len(cont_text)} 字")
+                else:
+                    _log_ts("[nostream] 自动续问确认任务已结束")
             else:
-                _log_ts("[nostream] 宣告恢复: 重试未产出工具调用，保留原回复")
+                _log_ts("[nostream] 判定为完成答案，正常结束")
+
+        if full_content:
+            full_content = strip_final_marker(str(full_content)) or None
 
         message_obj = {"role": "assistant", "content": full_content}
         if tool_calls:

@@ -217,6 +217,7 @@ def refresh_once(max_wait: int = LOGIN_WAIT_SECONDS):
     sso_clicked = False
     form_filled = False
     submitted = False
+    stale_token_seen = False
 
     while time.time() < deadline:
         try:
@@ -234,10 +235,17 @@ def refresh_once(max_wait: int = LOGIN_WAIT_SECONDS):
                 continue
 
             # 1) 任意学校页面：尝试读取 Token（登录成功即出现）
+            #    页面 localStorage 可能残留过期 Token，不能直接当新凭据返回，
+            #    否则会跳过后续 SSO 登录流程，续期永远失败。
             try:
                 token = gt.read_token_from_page(ws)
                 if token:
-                    return token
+                    expiry = gt.decode_expiry(token)
+                    if expiry is None or expiry > time.time() + 60:
+                        return token
+                    if not stale_token_seen:
+                        _log("页面中的 Token 已过期，继续走登录流程……")
+                        stale_token_seen = True
             except Exception:
                 pass
 

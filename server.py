@@ -331,6 +331,25 @@ def find_model_config(model_id: str) -> Dict[str, Any]:
     }
 
 
+SEARCH_MODEL_ALIASES = {
+    "deepseek-pro-search": "DeepSeek-V4.1-Flash",
+    "deepseek-v4.1-flash-search": "DeepSeek-V4.1-Flash",
+}
+
+
+def resolve_model_alias(model_name: str) -> Tuple[str, bool]:
+    """解析“模型名-search”别名，返回 (基础模型, 是否启用联网搜索)。"""
+    raw = (model_name or "").strip()
+    key = raw.lower()
+    if key in SEARCH_MODEL_ALIASES:
+        return SEARCH_MODEL_ALIASES[key], True
+    if key.endswith("-search"):
+        base = raw[: -len("-search")]
+        if find_model_config(base):
+            return base, True
+    return raw, False
+
+
 # ---------------- 网络层 ----------------
 
 
@@ -461,6 +480,29 @@ def list_models():
                     "owned_by": "shanghaitech",
                 }
             )
+    existing_ids = {str(m.get("id", "")).lower() for m in openai_models}
+    for alias in ("deepseek-pro-search", "DeepSeek-V4.1-Flash-search"):
+        if alias.lower() in existing_ids:
+            continue
+        openai_models.append(
+            {
+                "id": alias,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "shanghaitech",
+                "permission": [],
+                "root": "deepseek-pro",
+                "parent": None,
+                "capabilities": {
+                    "chat": True,
+                    "vision": False,
+                    "documents": False,
+                    "image_generation": False,
+                    "deep_thinking": False,
+                    "search": True,
+                },
+            }
+        )
     return jsonify({"object": "list", "data": openai_models})
 
 # ---------------- Anthropic Messages 适配（学习 jollyxenon / Blue-Flag / XV2004） ----------------
@@ -1365,6 +1407,261 @@ def call_upstream_json(
     return result
 
 
+def fetch_search_references(
+    payload: Dict[str, Any], query: str
+) -> Dict[str, Any]:
+    """查询学校联网搜索的参考来源面板（links + count）。"""
+    body = {
+        "chatInfo": query,
+        "messages": [{"role": "user", "content": query}],
+        "type": "3",
+        "stream": True,
+        "aiType": payload.get("aiType"),
+        "aiSecType": "1",
+        "rootAiType": payload.get("rootAiType", "xinference"),
+        "maxToken": payload.get("maxToken", 4096),
+        "netGo": True,
+    }
+    try:
+        resp = httpx.post(
+            f"{SHANGHAITECH_BASE_URL}/chat/net/search",
+            headers=get_headers(),
+            json=body,
+            verify=False,
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            return {"error": f"search http {resp.status_code}"}
+        data = resp.json()
+        result = data.get("result")
+        if data.get("success") is True and isinstance(result, dict):
+            links = result.get("links")
+            if not isinstance(links, list):
+                links = []
+            return {"links": links, "count": result.get("count", len(links))}
+        return {
+            "error": str(
+                data.get("errMsg") or data.get("message") or "search failed"
+            )[:200]
+        }
+    except Exception as exc:
+        return {"error": f"search unavailable: {type(exc).__name__}"}
+
+
+def _with_search_refs(
+    chunk: Dict[str, Any],
+    enabled: bool,
+    payload: Dict[str, Any],
+    query: str,
+) -> Dict[str, Any]:
+    """给最终响应块附加参考来源（仅联网模型）。"""
+    if enabled:
+        chunk["search_results"] = fetch_search_references(payload, query)
+    return chunk
+
+
+MAX_SEARCH_QUERIES = 6
+
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the school's web search service for current information. "
+            "Returns a synthesized answer plus source links."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query, usually the user's current question.",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def _compact_search_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """压缩搜索记录，避免把整页 snippet 塞回模型上下文。"""
+    sources = record.get("sources")
+    if not isinstance(sources, dict):
+        sources = {}
+    links = sources.get("links")
+    if not isinstance(links, list):
+        links = []
+    compact_links = []
+    for item in links[:6]:
+        if not isinstance(item, dict):
+            continue
+        compact_links.append(
+            {
+                "num": item.get("num"),
+                "title": str(item.get("title") or "")[:200],
+                "link": item.get("link"),
+                "snippet": str(item.get("snippet") or "")[:300],
+            }
+        )
+    compact = {
+        "query": record.get("query"),
+        "answer": str(record.get("answer") or "")[:4000],
+        "links": compact_links,
+        "count": sources.get("count", len(links)),
+    }
+    if record.get("error"):
+        compact["error"] = record["error"]
+    return compact
+
+
+def search_once(query: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """对单个查询执行一次学校联网搜索：答案 + 来源。"""
+    query = (query or "").strip()[:2000]
+    if not query:
+        return {"query": "", "error": "empty query"}
+    answer = ""
+    search_payload = {
+        "chatInfo": query,
+        "messages": [{"role": "user", "content": query}],
+        "type": "3",
+        "stream": True,
+        "aiType": payload.get("aiType"),
+        "aiSecType": "1",
+        "rootAiType": payload.get("rootAiType", "xinference"),
+        "maxToken": min(int(payload.get("maxToken") or 4096), 4096),
+        "netGo": True,
+    }
+    try:
+        for ev in call_upstream_stream(search_payload):
+            ch = (ev.get("choices") or [{}])[0]
+            answer += (ch.get("delta") or {}).get("content") or ""
+    except Exception as exc:
+        return {
+            "query": query,
+            "error": f"search answer failed: {type(exc).__name__}",
+        }
+    record = {
+        "query": query,
+        "answer": strip_final_marker(answer or ""),
+        "sources": fetch_search_references(payload, query),
+    }
+    _log_ts(f"[search] {query[:60]!r} -> {len(record['answer'])} 字")
+    return record
+
+
+def run_search_agent(
+    payload: Dict[str, Any],
+    allowed_names: Optional[set],
+    user_text: str,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """模型发起 web_search 时由反代执行，直到产出最终答案或本地工具调用。"""
+    history = list(payload.get("messages") or [])
+    base_chat_info = str(payload.get("chatInfo") or "")
+    records: List[Dict[str, Any]] = []
+    last_text = ""
+
+    for step in range(4):
+        current = dict(payload)
+        current["messages"] = history
+        current["netGo"] = False
+        if step:
+            current["chatInfo"] = (
+                base_chat_info
+                + "\n\n<search_continuation>\n"
+                + "The search results are already in the conversation. If you still "
+                + "need current information, call web_search again. Otherwise call "
+                + "the appropriate local tool or give the final answer.\n"
+                + "</search_continuation>"
+            )
+
+        text = ""
+        native: Dict[int, Dict[str, Any]] = {}
+        for ev in call_upstream_stream(current):
+            ch = (ev.get("choices") or [{}])[0]
+            delta = ch.get("delta") or {}
+            text += delta.get("content") or ""
+            if delta.get("tool_calls"):
+                _accumulate_native_calls(native, delta["tool_calls"])
+
+        clean, calls = ("", [])
+        if TOOL_ENGINE_AVAILABLE:
+            clean, calls = extract_tool_calls(
+                text, tools_present=True, allowed_names=allowed_names
+            )
+        calls = calls or []
+        clean = clean or ""
+        for _, tc in sorted(native.items()):
+            native_call = dict(tc)
+            native_call["index"] = len(calls)
+            calls.append(native_call)
+        clean = strip_final_marker(clean or "")
+        last_text = clean
+
+        search_calls = [
+            c
+            for c in calls
+            if (c.get("function") or {}).get("name") == "web_search"
+        ]
+        local_calls = [
+            c
+            for c in calls
+            if (c.get("function") or {}).get("name") != "web_search"
+        ]
+        if not search_calls:
+            return clean, local_calls, records
+
+        remaining = MAX_SEARCH_QUERIES - len(records)
+        if remaining <= 0:
+            _log_ts("[search] 达到搜索次数上限")
+            return last_text, local_calls, records
+
+        results = []
+        for call in search_calls[: min(4, remaining)]:
+            raw_args = (call.get("function") or {}).get("arguments") or "{}"
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                args = {}
+            query = args.get("query") if isinstance(args, dict) else None
+            if not isinstance(query, str) or not query.strip():
+                query = user_text
+            results.append(search_once(query, payload))
+        records.extend(results)
+
+        # 只把 web_search 记为已执行；同批的本地工具调用丢弃，让模型看到搜索结果后重新决定。
+        assistant_text = clean.strip()
+        call_summary = json.dumps(
+            [
+                {
+                    "name": "web_search",
+                    "arguments": (c.get("function") or {}).get("arguments"),
+                }
+                for c in search_calls
+            ],
+            ensure_ascii=False,
+        )
+        assistant_text = (
+            f"{assistant_text}\n\n调用工具: {call_summary}"
+            if assistant_text
+            else f"调用工具: {call_summary}"
+        )
+        history.append({"role": "assistant", "content": assistant_text})
+        history.append(
+            {
+                "role": "user",
+                "content": "web_search 返回结果：\n"
+                + json.dumps(
+                    [_compact_search_record(r) for r in results],
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+    _log_ts("[search] 达到搜索轮次上限")
+    return last_text, [], records
+
+
 TOOL_REFUSAL_RE = re.compile(
     r"(?:tool(?:s| use| execution)? (?:is|are|was|were)?\s*(?:disabled|unavailable)|"
     r"can(?:not|'t) (?:use|invoke|access).{0,30}tool|"
@@ -1458,6 +1755,7 @@ def run_continuation(
         clean, calls = extract_tool_calls(
             text, tools_present=True, allowed_names=allowed_names
         )
+        calls = calls or []
     for _, tc in sorted(native.items()):
         native_call = dict(tc)
         native_call["index"] = len(calls)
@@ -1802,10 +2100,14 @@ def chat_completions():
             "tool_choice/function_call must be a string or object", "tool_choice"
         )
 
+    requested_model = model_name
+    base_model, search_enabled = resolve_model_alias(requested_model)
+
     # 请求摘要日志：用于诊断客户端是否传入了工具定义
     n_tools = len(req_data.get("tools") or req_data.get("functions") or [])
     print(
-        f"[req] {time.strftime('%H:%M:%S')} model={model_name} stream={stream} msgs={len(messages)} tools={n_tools}",
+        f"[req] {time.strftime('%H:%M:%S')} model={requested_model} stream={stream} "
+        f"msgs={len(messages)} tools={n_tools} search={search_enabled}",
         file=sys.stderr,
     )
 
@@ -1813,7 +2115,7 @@ def chat_completions():
         messages
     )
 
-    model_config = find_model_config(model_name)
+    model_config = find_model_config(base_model)
     if not model_config:
         return invalid(f"The model '{model_name}' does not exist", "model")
     model_status = str(model_config.get("status", "1"))
@@ -1827,7 +2129,7 @@ def chat_completions():
             "messages",
         )
     chat_group_id = uuid.uuid4().hex
-    ai_type = model_config.get("aiType", model_name)
+    ai_type = model_config.get("aiType", base_model)
 
     # 转存图片 → imageUrl / imageUrls
     image_urls: List[str] = []
@@ -1873,12 +2175,20 @@ def chat_completions():
     tool_choice = req_data.get("tool_choice", req_data.get("function_call", "auto"))
     if tool_choice == "none":
         tools = []
+    if search_enabled and tools and TOOL_ENGINE_AVAILABLE:
+        # 联网别名的 web_search 由反代执行；客户端自带的同名工具不参与本轮。
+        tools = [
+            t
+            for t in tools
+            if ((t.get("function") or {}).get("name") != "web_search")
+        ]
+        tools.append(WEB_SEARCH_TOOL)
     protocol_text = ""
     _allowed_names = allowed_tool_names(tools) if TOOL_ENGINE_AVAILABLE else None
     if tools and TOOL_ENGINE_AVAILABLE:
         # 协议必须位于用户任务之前。Kimi 等模型会拒绝末尾追加的“假装调用工具”指令，
         # 但能可靠地遵循“序列化请求，由外部程序执行”的明确协议。
-        if "kimi" in model_name.lower():
+        if "kimi" in base_model.lower():
             # Kimi-K3：学校部署原生的 k3 动作信封（OwenxuSH/shanghaitech-kimi-gateway 验证）
             protocol = build_k3_prompt(tools)
         else:
@@ -1910,7 +2220,7 @@ def chat_completions():
         "chatGroupId": chat_group_id,
         "rootAiType": model_config.get("rootAiType", "azure"),
         "maxToken": max_tokens,
-        "netGo": bool(req_data.get("net_search", False)),
+        "netGo": bool(req_data.get("net_search", False)) or search_enabled,
     }
     if is_model_thinking_capable:
         payload["thinking"] = should_think
@@ -1926,6 +2236,107 @@ def chat_completions():
     created_time = int(time.time())
     upstream_model = model_name
 
+    # 联网 + 工具：web_search 由反代执行，其余本地工具仍交还客户端。
+    if search_enabled and tools and TOOL_ENGINE_AVAILABLE:
+        agent_text, agent_calls, search_records = run_search_agent(
+            payload, _allowed_names, original_chat_info
+        )
+        compact_records = [_compact_search_record(r) for r in search_records]
+        search_results = {"searches": compact_records} if compact_records else None
+
+        if stream:
+
+            def search_stream():
+                if not agent_text and not agent_calls:
+                    err = {
+                        "error": {
+                            "message": "Search agent produced no final response",
+                            "type": "server_error",
+                        }
+                    }
+                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                if agent_text:
+                    content_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": upstream_model or model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": agent_text},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
+                if agent_calls:
+                    indexed = [
+                        dict(c, index=i) for i, c in enumerate(agent_calls)
+                    ]
+                    final_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": upstream_model or model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "tool_calls": indexed},
+                            "finish_reason": "tool_calls",
+                        }],
+                    }
+                else:
+                    final_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": upstream_model or model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }],
+                    }
+                if search_results:
+                    final_chunk["search_results"] = search_results
+                yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return Response(search_stream(), mimetype="text/event-stream")
+
+        if not agent_text and not agent_calls:
+            return jsonify(
+                {
+                    "error": {
+                        "message": "Search agent produced no final response",
+                        "type": "server_error",
+                    }
+                }
+            ), 502
+        message_obj = {"role": "assistant", "content": agent_text or None}
+        if agent_calls:
+            message_obj["tool_calls"] = agent_calls
+        agent_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": len(agent_text),
+            "total_tokens": len(agent_text),
+        }
+        response_data = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_time,
+            "model": upstream_model or model_name,
+            "choices": [{
+                "index": 0,
+                "message": message_obj,
+                "finish_reason": "tool_calls" if agent_calls else "stop",
+            }],
+            "usage": agent_usage,
+        }
+        if search_results:
+            response_data["search_results"] = search_results
+        return jsonify(response_data)
+
     if stream:
 
         def generate() -> Generator[str, None, None]:
@@ -1938,7 +2349,7 @@ def chat_completions():
             emitted_tool_calls = False
             final_finish_reason = None  # 上游 finish_reason 先扣住，恢复逻辑跑完再发
             final_emitted = False       # 是否已有最终 finish_reason chunk
-            is_tool_stream = bool(tools and "kimi" in model_name.lower())
+            is_tool_stream = bool(tools and "kimi" in base_model.lower())
             _log_ts(f"[stream] 开始: model={model_name} stream=True tools={len(tools or [])}")
             if TOKEN_AUTO_REFRESH_AVAILABLE:
                 token_auto_refresh.stream_started()
@@ -2146,6 +2557,9 @@ def chat_completions():
                                 }
                             ],
                         }
+                        tool_chunk = _with_search_refs(
+                            tool_chunk, search_enabled, payload, original_chat_info
+                        )
                         yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
                         final_emitted = True
                         emitted_tool_calls = True
@@ -2163,6 +2577,9 @@ def chat_completions():
                                 }
                             ],
                         }
+                        text_chunk = _with_search_refs(
+                            text_chunk, search_enabled, payload, original_chat_info
+                        )
                         yield f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n"
                         final_emitted = True
 
@@ -2181,6 +2598,9 @@ def chat_completions():
                                 "finish_reason": "stop",
                             }],
                         }
+                        rec_chunk = _with_search_refs(
+                            rec_chunk, search_enabled, payload, original_chat_info
+                        )
                         yield f"data: {json.dumps(rec_chunk, ensure_ascii=False)}\n\n"
                         final_emitted = True
                         recovered = True
@@ -2221,6 +2641,9 @@ def chat_completions():
                                     "finish_reason": "tool_calls",
                                 }],
                             }
+                            tch2 = _with_search_refs(
+                                tch2, search_enabled, payload, original_chat_info
+                            )
                             yield f"data: {json.dumps(tch2, ensure_ascii=False)}\n\n"
                             final_emitted = True
                             emitted_tool_calls = True
@@ -2238,6 +2661,9 @@ def chat_completions():
                                     "finish_reason": "stop",
                                 }],
                             }
+                            rec2 = _with_search_refs(
+                                rec2, search_enabled, payload, original_chat_info
+                            )
                             yield f"data: {json.dumps(rec2, ensure_ascii=False)}\n\n"
                             final_emitted = True
                             recovered = True
@@ -2339,6 +2765,9 @@ def chat_completions():
                             "finish_reason": final_reason,
                         }],
                     }
+                    final_chunk = _with_search_refs(
+                        final_chunk, search_enabled, payload, original_chat_info
+                    )
                     yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
 
                 yield "data: [DONE]\n\n"
@@ -2562,18 +2991,21 @@ def chat_completions():
         if thinking_content and should_think:
             message_obj["reasoning_content"] = thinking_content
 
-        return jsonify(
-            {
-                "id": completion_id,
-                "object": "chat.completion",
-                "created": created_time,
-                "model": upstream_model or model_name,
-                "choices": [
-                    {"index": 0, "message": message_obj, "finish_reason": finish_reason}
-                ],
-                "usage": usage_info,
-            }
-        )
+        response_data = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_time,
+            "model": upstream_model or model_name,
+            "choices": [
+                {"index": 0, "message": message_obj, "finish_reason": finish_reason}
+            ],
+            "usage": usage_info,
+        }
+        if search_enabled:
+            response_data["search_results"] = fetch_search_references(
+                payload, original_chat_info
+            )
+        return jsonify(response_data)
 
 
 # ---------------- 启动 ----------------

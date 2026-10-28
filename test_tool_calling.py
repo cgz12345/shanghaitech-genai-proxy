@@ -14,6 +14,7 @@ from server import (
     hoist_system_messages,
     is_tool_refusal,
     parse_action_verdict,
+    resolve_model_alias,
     validate_remote_url,
 )
 
@@ -139,6 +140,16 @@ class ToolCallingTests(unittest.TestCase):
         self.assertFalse(parse_action_verdict("ANSWER"))
         self.assertFalse(parse_action_verdict("answer."))
         self.assertIsNone(parse_action_verdict("maybe"))
+
+    def test_search_alias_resolution(self):
+        self.assertEqual(
+            ("DeepSeek-V4.1-Flash", True),
+            resolve_model_alias("deepseek-pro-search"),
+        )
+        self.assertEqual(
+            ("DeepSeek-V4.1-Flash", False),
+            resolve_model_alias("DeepSeek-V4.1-Flash"),
+        )
 
     def test_system_messages_are_hoisted_into_chat_info(self):
         chat_info, msgs = hoist_system_messages(

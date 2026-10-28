@@ -9,6 +9,7 @@
 - **完整 OpenAI Chat Completions**：流式（SSE）与非流式，`/v1/models` 动态枚举。
 - **Agent 工具调用（Function Calling）**：支持 `tools` / `tool_choice` 与旧版 `functions` / `function_call`，包括流式 `delta.tool_calls` 与工具结果回传；可把网页模型生成的各种工具调用格式（含 Qwen 私有标记）统一转换为标准结构。
 - **多模态**：图片理解（`image_url`，支持 Base64 与远程 URL）、PDF 文档问答（`type: file`）。
+- **联网搜索**：模型名加 `-search`（如 `DeepSeek-V4.1-Flash-search`）即启用学校网页联网，并在响应中回传参考来源；带工具时 `web_search` 由反代执行，本地工具仍交给客户端。
 - **额外入口**：文生图 `/v1/images/generations`、文字转语音 `/v1/audio/speech`、语音转文字 `/v1/audio/transcriptions`、**Anthropic Messages `/v1/messages`**（Claude Code / Claude 系客户端原生可用，含流式与 tool_use）、**OpenAI Responses `/v1/responses`**（Codex CLI 可用，含流式事件与 function_call/custom_tool_call）、单模型查询 `/v1/models/{id}`、存活检查 `/healthz`。
 - **零配置刷新凭据**：`get_token.bat` 自动打开独立浏览器窗口，登录后自动提取并验证凭据，无需 F12。
 - **凭据自动续期**：服务内置后台守护，Token 过期前 2 小时自动通过专用浏览器静默续期（SSO 会话存活时全程零交互）。若 SSO 会话也失效，可创建 `credentials.txt`（格式见 `credentials.txt.example`）实现全自动登录；未配置时保持浏览器窗口打开并弹窗提醒手动登录。
@@ -84,6 +85,33 @@ client.chat.completions.create(
     ]}],
 )
 ```
+
+## 联网搜索
+
+模型名加 `-search` 即启用学校联网搜索（上游 `netGo`）：
+
+- `deepseek-pro-search`（兼容别名）
+- `DeepSeek-V4.1-Flash-search`
+
+不传 `tools` 时走直接联网：模型正常回答，最终 SSE 块（或非流式响应顶层）会多一个非标准字段 `search_results`：
+
+```json
+{"links": [{"num": 1, "title": "...", "link": "https://...", "snippet": "..."}], "count": 10}
+```
+
+传了 `tools` 时，反代会在工具列表里加入一个由自己执行的 `web_search`：
+
+1. 模型调用 `web_search({"query": "..."})`，反代查询学校联网搜索，拿到答案与来源；
+2. 结果回灌给模型，模型继续调用本地工具或给出最终答案；
+3. 客户端只会收到本地工具调用或最终文本，不会看到 `web_search`。
+
+此时 `search_results` 的结构为：
+
+```json
+{"searches": [{"query": "...", "answer": "...", "links": [...], "count": 10}]}
+```
+
+说明：`-search` 模型下 `web_search` 这个工具名由反代保留，客户端自带的同名工具会被替换；每个请求最多执行 6 次搜索，避免递归失控。联网会多一次模型+搜索调用，延迟高于普通对话。
 
 ## 运维
 
